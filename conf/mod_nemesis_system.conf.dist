@@ -105,6 +105,17 @@ NemesisSystem.AllowRareElite = 1
 NemesisSystem.AllowWorldBoss = 0
 
 #
+#    NemesisSystem.MaxPerZone
+#        Description: Maximum number of active nemeses allowed per zone.
+#                     New nemesis creation is blocked in a zone once this
+#                     limit is reached (existing nemeses can still rank up).
+#                     Set to 0 for unlimited.
+#        Default:     20
+#
+
+NemesisSystem.MaxPerZone = 20
+
+#
 #    NemesisSystem.RankUpCooldownSeconds
 #        Description: Minimum time in seconds before the same creature can gain
 #                     another nemesis promotion.
@@ -182,7 +193,7 @@ NemesisSystem.RevengeRewardItemPerRankBonus = 0
 #        Default:     10000
 #
 
-NemesisSystem.RevengeRewardGold = 10000
+NemesisSystem.RevengeRewardGold = 1
 
 #
 #    NemesisSystem.RevengeRewardGoldPerRankBonus
@@ -190,7 +201,7 @@ NemesisSystem.RevengeRewardGold = 10000
 #        Default:     2500
 #
 
-NemesisSystem.RevengeRewardGoldPerRankBonus = 2500
+NemesisSystem.RevengeRewardGoldPerRankBonus = 1
 
 #
 #    NemesisSystem.BountyRewardItem
@@ -223,7 +234,7 @@ NemesisSystem.BountyRewardItemPerRankBonus = 0
 #        Default:     2500
 #
 
-NemesisSystem.BountyRewardGold = 2500
+NemesisSystem.BountyRewardGold = 1
 
 #
 #    NemesisSystem.BountyRewardGoldPerRankBonus
@@ -231,7 +242,7 @@ NemesisSystem.BountyRewardGold = 2500
 #        Default:     500
 #
 
-NemesisSystem.BountyRewardGoldPerRankBonus = 500
+NemesisSystem.BountyRewardGoldPerRankBonus = 1
 
 #
 #    NemesisSystem.RewardOverlevelDiffMax

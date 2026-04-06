@@ -11,8 +11,10 @@
 #include "Group.h"
 #include "GuildMgr.h"
 #include "Map.h"
+#include "MapMgr.h"
 #include "ObjectGuid.h"
 #include "ObjectMgr.h"
+#include "Mail.h"
 #include "Player.h"
 #include "Random.h"
 #include "ScriptMgr.h"
@@ -98,7 +100,138 @@ namespace
         std::string rewardClass;
         std::string threatClass;
         uint32 lastSeenAt = 0;
+        std::string runtimeGuid;
+        std::string nemesisTitle;
     };
+
+    // Nemesis title generator — deterministic from spawnId + creatureEntry
+    // Russian nemesis name generator: 40 prefixes x 40 suffixes x 25 titles = 40,000 combinations
+    static constexpr char const* NemesisPrefixes[] = {
+        "\xD0\x9A\xD1\x80\xD0\xBE\xD0\xB2\xD0\xBE",       // Кровo
+        "\xD0\xA2\xD0\xB5\xD0\xBD\xD0\xB5",                 // Тене
+        "\xD0\x9C\xD1\x80\xD0\xB0\xD0\xBA\xD0\xBE",         // Мрако
+        "\xD0\xA1\xD0\xBC\xD0\xB5\xD1\x80\xD1\x82\xD0\xBE", // Смерто
+        "\xD0\x93\xD0\xBD\xD0\xB8\xD0\xBB\xD0\xBE",         // Гнило
+        "\xD0\x9A\xD0\xBE\xD1\x81\xD1\x82\xD0\xBE",         // Косто
+        "\xD0\x9F\xD0\xBB\xD0\xB0\xD0\xBC\xD0\xB5",         // Пламе
+        "\xD0\x9B\xD0\xB5\xD0\xB4\xD0\xBE",                 // Ледо
+        "\xD0\xAF\xD0\xB4\xD0\xBE",                         // Ядо
+        "\xD0\x93\xD1\x80\xD0\xBE\xD0\xBC\xD0\xBE",         // Громо
+        "\xD0\x94\xD1\x8B\xD0\xBC\xD0\xBE",                 // Дымо
+        "\xD0\x96\xD0\xB5\xD0\xBB\xD0\xB5\xD0\xB7\xD0\xBE", // Железо
+        "\xD0\xA8\xD0\xB8\xD0\xBF\xD0\xBE",                 // Шипо
+        "\xD0\x97\xD0\xBB\xD0\xBE",                         // Зло
+        "\xD0\xA5\xD0\xBB\xD0\xB0\xD0\xB4\xD0\xBE",         // Хладо
+        "\xD0\x93\xD0\xBD\xD0\xB5\xD0\xB2\xD0\xBE",         // Гнево
+        "\xD0\xA7\xD1\x83\xD0\xBC\xD0\xBE",                 // Чумо
+        "\xD0\x9C\xD0\xBE\xD1\x80\xD0\xBE",                 // Моро
+        "\xD0\xA1\xD0\xBA\xD0\xB2\xD0\xB5\xD1\x80",         // Сквер
+        "\xD0\x9F\xD0\xB5\xD0\xBF\xD0\xB5\xD0\xBB\xD0\xBE", // Пепело
+        "\xD0\x9D\xD0\xBE\xD1\x87\xD0\xB5",                 // Ноче
+        "\xD0\xA0\xD0\xB6\xD0\xB0\xD0\xB2\xD0\xBE",         // Ржаво
+        "\xD0\x93\xD0\xBD\xD1\x83\xD1\x81\xD0\xBE",         // Гнусо
+        "\xD0\xA1\xD0\xBC\xD1\x80\xD0\xB0\xD0\xB4\xD0\xBE", // Смрадо
+        "\xD0\x96\xD1\x83\xD1\x82\xD0\xBA\xD0\xBE",         // Жутко
+        "\xD0\x9F\xD0\xBE\xD0\xB3\xD0\xB0\xD0\xBD\xD0\xBE", // Погано
+        "\xD0\x94\xD1\x80\xD0\xBE\xD0\xB6\xD0\xB5",         // Дроже
+        "\xD0\xA1\xD0\xBB\xD0\xB8\xD0\xB7\xD0\xBD\xD0\xBE", // Слизно
+        "\xD0\xA5\xD1\x80\xD0\xB8\xD0\xBF\xD0\xBE",         // Хрипо
+        "\xD0\x9F\xD1\x80\xD0\xB0\xD1\x85\xD0\xBE",         // Прахо
+        "\xD0\x92\xD0\xBE\xD0\xBB\xD1\x87\xD0\xBE",         // Волчо
+        "\xD0\x97\xD0\xBC\xD0\xB5\xD0\xB5",                 // Змее
+        "\xD0\x9A\xD0\xBE\xD0\xB3\xD1\x82\xD0\xB5",         // Когте
+        "\xD0\x9A\xD0\xBB\xD1\x8B\xD0\xBA\xD0\xBE",         // Клыко
+        "\xD0\x93\xD0\xBE\xD1\x80\xD0\xB5",                 // Горе
+        "\xD0\xA2\xD1\x83\xD1\x85\xD0\xBB\xD0\xBE",         // Тухло
+        "\xD0\xA5\xD0\xB0\xD0\xBE\xD1\x81\xD0\xBE",         // Хаосо
+        "\xD0\x91\xD0\xB5\xD1\x81\xD0\xBE",                 // Бесо
+        "\xD0\x9F\xD1\x80\xD0\xBE\xD0\xBA\xD0\xBB\xD1\x8F\xD1\x82\xD0\xBE", // Проклято
+        "\xD0\xA2\xD1\x80\xD1\x83\xD0\xBF\xD0\xBE"          // Трупо
+    };
+
+    static constexpr char const* NemesisSuffixes[] = {
+        "\xD0\xB7\xD1\x83\xD0\xB1",           // зуб
+        "\xD0\xBA\xD0\xBE\xD0\xB3\xD0\xBE\xD1\x82\xD1\x8C", // коготь
+        "\xD1\x88\xD0\xBA\xD1\x83\xD1\x80",   // шкур
+        "\xD0\xBA\xD0\xBB\xD1\x8B\xD0\xBA",   // клык
+        "\xD1\x80\xD0\xBE\xD0\xB3",           // рог
+        "\xD0\xB3\xD0\xBB\xD0\xB0\xD0\xB7",   // глаз
+        "\xD1\x85\xD0\xB2\xD0\xBE\xD1\x81\xD1\x82", // хвост
+        "\xD0\xBF\xD0\xB0\xD1\x81\xD1\x82\xD1\x8C", // пасть
+        "\xD0\xBB\xD0\xB0\xD0\xBF",           // лап
+        "\xD1\x80\xD1\x8B\xD0\xBA",           // рык
+        "\xD0\xB2\xD0\xBE\xD0\xB9",           // вой
+        "\xD1\x83\xD0\xB4\xD0\xB0\xD1\x80",   // удар
+        "\xD0\xB6\xD0\xB0\xD0\xBB\xD0\xBE",   // жало
+        "\xD1\x85\xD1\x80\xD0\xB5\xD0\xB1\xD0\xB5\xD1\x82", // хребет
+        "\xD0\xBC\xD0\xBE\xD1\x80",           // мор
+        "\xD0\xBF\xD0\xBB\xD0\xB5\xD1\x82\xD1\x8C", // плеть
+        "\xD0\xB3\xD1\x80\xD1\x8B\xD0\xB7",   // грыз
+        "\xD1\x85\xD0\xB2\xD0\xB0\xD1\x82",   // хват
+        "\xD0\xB6\xD0\xBE\xD1\x80",           // жор
+        "\xD0\xB2\xD0\xB8\xD0\xB7\xD0\xB3",   // визг
+        "\xD1\x88\xD0\xB8\xD0\xBF",           // шип
+        "\xD1\x80\xD1\x91\xD0\xB2",           // рёв
+        "\xD0\xB4\xD1\x80\xD0\xBE\xD0\xB1\xD1\x8C", // дробь
+        "\xD1\x82\xD1\x80\xD0\xB5\xD1\x81\xD0\xBA", // треск
+        "\xD1\x81\xD0\xBA\xD1\x80\xD0\xB5\xD0\xB6\xD0\xB5\xD1\x82", // скрежет
+        "\xD0\xBF\xD0\xBE\xD0\xB6\xD0\xB0\xD1\x80", // пожар
+        "\xD1\x82\xD0\xBE\xD0\xBF",           // топ
+        "\xD0\xB3\xD1\x80\xD0\xBE\xD1\x85\xD0\xBE\xD1\x82", // грохот
+        "\xD0\xBF\xD1\x80\xD1\x8B\xD0\xB6\xD0\xBE\xD0\xBA", // прыжок
+        "\xD1\x81\xD0\xBA\xD1\x83\xD0\xBB\xD1\x91\xD0\xB6", // скулёж
+        "\xD0\xBC\xD0\xBE\xD1\x80\xD0\xB4",   // морд
+        "\xD0\xBF\xD1\x83\xD0\xBA",           // пук
+        "\xD0\xBF\xD1\x83\xD0\xB7\xD0\xBE",   // пузо
+        "\xD1\x85\xD1\x80\xD1\x83\xD1\x81\xD1\x82", // хруст
+        "\xD0\xB1\xD1\x80\xD1\x8B\xD0\xB7\xD0\xB3", // брызг
+        "\xD1\x87\xD0\xB0\xD0\xB2\xD0\xBA",   // чавк
+        "\xD0\xBA\xD1\x83\xD1\x81",           // кус
+        "\xD0\xBF\xD1\x80\xD1\x8B\xD1\x89",   // прыщ
+        "\xD0\xBF\xD1\x83\xD0\xBA\xD1\x81",   // пукс
+        "\xD1\x88\xD0\xBB\xD1\x91\xD0\xBF"    // шлёп
+    };
+
+    static constexpr char const* NemesisTitles[] = {
+        "\xD0\x9D\xD0\xB5\xD0\xBD\xD0\xB0\xD1\x81\xD1\x8B\xD1\x82\xD0\xBD\xD1\x8B\xD0\xB9", // Ненасытный
+        "\xD0\x91\xD0\xB5\xD0\xB7\xD0\xB6\xD0\xB0\xD0\xBB\xD0\xBE\xD1\x81\xD1\x82\xD0\xBD\xD1\x8B\xD0\xB9", // Безжалостный
+        "\xD0\xA1\xD0\xB2\xD0\xB8\xD1\x80\xD0\xB5\xD0\xBF\xD1\x8B\xD0\xB9", // Свирепый
+        "\xD0\x9D\xD0\xB5\xD1\x83\xD0\xBA\xD1\x80\xD0\xBE\xD1\x82\xD0\xB8\xD0\xBC\xD1\x8B\xD0\xB9", // Неукротимый
+        "\xD0\x9F\xD1\x80\xD0\xBE\xD0\xBA\xD0\xBB\xD1\x8F\xD1\x82\xD1\x8B\xD0\xB9", // Проклятый
+        "\xD0\x96\xD0\xB5\xD1\x81\xD1\x82\xD0\xBE\xD0\xBA\xD0\xB8\xD0\xB9", // Жестокий
+        "\xD0\x9A\xD1\x80\xD0\xBE\xD0\xB2\xD0\xBE\xD0\xB6\xD0\xB0\xD0\xB4\xD0\xBD\xD1\x8B\xD0\xB9", // Кровожадный
+        "\xD0\xAF\xD1\x80\xD0\xBE\xD1\x81\xD1\x82\xD0\xBD\xD1\x8B\xD0\xB9", // Яростный
+        "\xD0\x91\xD0\xB5\xD1\x88\xD0\xB5\xD0\xBD\xD1\x8B\xD0\xB9", // Бешеный
+        "\xD0\x96\xD1\x83\xD1\x82\xD0\xBA\xD0\xB8\xD0\xB9", // Жуткий
+        "\xD0\x9C\xD0\xB5\xD1\x80\xD0\xB7\xD0\xBA\xD0\xB8\xD0\xB9", // Мерзкий
+        "\xD0\x97\xD0\xBB\xD0\xBE\xD0\xB2\xD0\xB5\xD1\x89\xD0\xB8\xD0\xB9", // Зловещий
+        "\xD0\x9D\xD0\xB5\xD1\x83\xD0\xB4\xD0\xB5\xD1\x80\xD0\xB6\xD0\xB8\xD0\xBC\xD1\x8B\xD0\xB9", // Неудержимый
+        "\xD0\x9E\xD0\xB4\xD0\xB5\xD1\x80\xD0\xB6\xD0\xB8\xD0\xBC\xD1\x8B\xD0\xB9", // Одержимый
+        "\xD0\x9B\xD1\x8E\xD1\x82\xD1\x8B\xD0\xB9", // Лютый
+        "\xD0\x94\xD0\xB8\xD0\xBA\xD0\xB8\xD0\xB9", // Дикий
+        "\xD0\x9A\xD0\xBE\xD0\xB2\xD0\xB0\xD1\x80\xD0\xBD\xD1\x8B\xD0\xB9", // Коварный
+        "\xD0\xA3\xD0\xB6\xD0\xB0\xD1\x81\xD0\xBD\xD1\x8B\xD0\xB9", // Ужасный
+        "\xD0\x91\xD0\xB5\xD1\x81\xD0\xBF\xD0\xBE\xD1\x89\xD0\xB0\xD0\xB4\xD0\xBD\xD1\x8B\xD0\xB9", // Беспощадный
+        "\xD0\x92\xD0\xBE\xD0\xBD\xD1\x8E\xD1\x87\xD0\xB8\xD0\xB9", // Вонючий
+        "\xD0\x9F\xD1\x83\xD1\x85\xD0\xBB\xD1\x8B\xD0\xB9", // Пухлый
+        "\xD0\x9E\xD0\xB1\xD0\xB6\xD0\xBE\xD1\x80\xD0\xB8\xD1\x81\xD1\x82\xD1\x8B\xD0\xB9", // Обжористый
+        "\xD0\x97\xD0\xB0\xD0\xBF\xD0\xBB\xD0\xB5\xD1\x81\xD0\xBD\xD0\xB5\xD0\xB2\xD0\xB5\xD0\xBB\xD1\x8B\xD0\xB9", // Заплесневелый
+        "\xD0\x9F\xD1\x80\xD0\xBE\xD0\xB6\xD0\xBE\xD1\x80\xD0\xBB\xD0\xB8\xD0\xB2\xD1\x8B\xD0\xB9", // Прожорливый
+        "\xD0\x91\xD1\x83\xD0\xB9\xD0\xBD\xD1\x8B\xD0\xB9"  // Буйный
+    };
+
+    std::string GenerateNemesisTitle(ObjectGuid::LowType spawnId, uint32 creatureEntry)
+    {
+        uint32 const seed = uint32(spawnId) ^ (creatureEntry * 2654435761u);
+        uint32 const prefixCount = sizeof(NemesisPrefixes) / sizeof(NemesisPrefixes[0]);
+        uint32 const suffixCount = sizeof(NemesisSuffixes) / sizeof(NemesisSuffixes[0]);
+        uint32 const titleCount = sizeof(NemesisTitles) / sizeof(NemesisTitles[0]);
+        uint32 const prefixIdx = seed % prefixCount;
+        uint32 const suffixIdx = (seed / (prefixCount + 1u)) % suffixCount;
+        uint32 const titleIdx = (seed / ((prefixCount + 1u) * (suffixCount + 1u))) % titleCount;
+
+        return Acore::StringFormat("{}{} {}", NemesisPrefixes[prefixIdx], NemesisSuffixes[suffixIdx], NemesisTitles[titleIdx]);
+    }
 
     using NemesisStore = std::unordered_map<ObjectGuid::LowType, NemesisState>;
     using NemesisTickStore = std::unordered_map<ObjectGuid::LowType, uint32>;
@@ -111,8 +244,8 @@ namespace
     TemporaryNemesisTickStore TemporaryRegenTickAccumulators;
     bool CacheLoaded = false;
 
-    std::string constexpr NEMESIS_ADDON_PREFIX = "Nemesis";
-    size_t constexpr NEMESIS_ADDON_CHUNK_SIZE = 220;
+    constexpr char NEMESIS_ADDON_PREFIX[] = "Nemesis";
+    size_t constexpr NEMESIS_ADDON_CHUNK_SIZE = 450;
 
     Creature* FindLoadedCreatureBySpawnId(Map* map, ObjectGuid::LowType spawnId);
     std::string GetNemesisDisplayName(Map* map, ObjectGuid::LowType spawnId, NemesisState const& state);
@@ -177,6 +310,23 @@ namespace
     uint32 GetDecayHours()
     {
         return sConfigMgr->GetOption<uint32>("NemesisSystem.DecayHours", 48);
+    }
+
+    uint32 GetMaxPerZone()
+    {
+        return sConfigMgr->GetOption<uint32>("NemesisSystem.MaxPerZone", 20);
+    }
+
+    uint32 CountNemesesInZone(uint32 zoneId)
+    {
+        EnsureCacheLoaded();
+
+        uint32 count = 0;
+        for (auto const& [spawnId, state] : ActiveNemeses)
+            if (state.zoneId == zoneId)
+                ++count;
+
+        return count;
     }
 
     uint32 GetRankUpCooldownSeconds()
@@ -322,7 +472,14 @@ namespace
 
     float GetDamageMultiplier(uint8 rank)
     {
-        return GetHealthMultiplier(rank);
+        switch (rank)
+        {
+            case 1: return 1.25f;
+            case 2: return 1.50f;
+            case 3: return 1.75f;
+            case 4: return 2.00f;
+            default: return 2.50f;
+        }
     }
 
     float GetVampiricHealPct()
@@ -508,7 +665,8 @@ namespace
             return;
         }
 
-        std::string id = std::to_string(uint32(GameTime::GetGameTime().count())) + "_" + std::to_string(player->GetGUID().GetCounter());
+        static uint32 chunkCounter = 0;
+        std::string id = std::to_string(++chunkCounter) + "_" + std::to_string(player->GetGUID().GetCounter());
         std::vector<std::string> chunks;
         size_t offset = 0;
 
@@ -591,6 +749,7 @@ namespace
         NemesisAddonView view;
         view.spawnId = spawnId;
         view.creatureEntry = state.creatureEntry;
+        view.nemesisTitle = SanitizeAddonField(GenerateNemesisTitle(spawnId, state.creatureEntry));
         view.mapId = state.mapId;
         view.zoneId = state.zoneId;
         view.zoneName = SanitizeAddonField(GetZoneName(state.zoneId));
@@ -607,13 +766,16 @@ namespace
         view.rewardClass = GetRewardClassForPlayer(player, state);
         view.lastSeenAt = state.lastSeenAt ? state.lastSeenAt : state.createdAt;
 
-        Map* playerMap = player ? player->GetMap() : nullptr;
-        if (playerMap && playerMap->GetId() != state.mapId)
-            playerMap = nullptr;
+        Map* searchMap = player ? player->GetMap() : nullptr;
+        if (searchMap && searchMap->GetId() != state.mapId)
+            searchMap = sMapMgr->FindBaseNonInstanceMap(state.mapId);
 
-        if (Creature* liveCreature = FindLoadedCreatureBySpawnId(playerMap, spawnId))
+        if (Creature* liveCreature = FindLoadedCreatureBySpawnId(searchMap, spawnId))
         {
-            view.name = SanitizeAddonField(liveCreature->GetName());
+            if (CreatureTemplate const* ct = liveCreature->GetCreatureTemplate())
+                view.name = SanitizeAddonField(ct->Name);
+            else
+                view.name = SanitizeAddonField(liveCreature->GetName());
             view.zoneId = liveCreature->GetZoneId();
             view.zoneName = SanitizeAddonField(GetZoneName(view.zoneId));
             view.x = liveCreature->GetPositionX();
@@ -622,6 +784,7 @@ namespace
             view.level = liveCreature->GetLevel();
             view.lastSeenAt = uint32(GameTime::GetGameTime().count());
             view.threatClass = GetThreatClassForPlayer(player, state, view.level);
+            view.runtimeGuid = Acore::StringFormat("0x{:016X}", liveCreature->GetGUID().GetRawValue());
         }
         else
         {
@@ -646,7 +809,7 @@ namespace
     std::string BuildAddonEntryPayload(char const* opcode, NemesisAddonView const& view)
     {
         return Acore::StringFormat(
-            "V2:{}:{}:{}:{}:{}:{}:{}:{:.1f}:{:.1f}:{:.1f}:{:.2f}:{:.2f}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "V2:{}:{}:{}:{}:{}:{}:{}:{:.1f}:{:.1f}:{:.1f}:{:.2f}:{:.2f}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             opcode,
             uint64(view.spawnId),
             view.creatureEntry,
@@ -669,7 +832,9 @@ namespace
             view.relation,
             view.rewardClass,
             view.threatClass,
-            view.lastSeenAt);
+            view.lastSeenAt,
+            view.runtimeGuid,
+            view.nemesisTitle);
     }
 
     std::string BuildHelloPayload(uint32 entryCount)
@@ -821,22 +986,8 @@ namespace
         return Acore::StringFormat("{:.1f}, {:.1f}, {:.1f}", creature->GetPositionX(), creature->GetPositionY(), creature->GetPositionZ());
     }
 
-    void BroadcastNemesisMessage(Creature* creature, std::string const& message, bool serverWide = false)
+    void BroadcastNemesisMessage(Creature* /*creature*/, std::string const& message, bool /*serverWide*/ = false)
     {
-        if (serverWide)
-        {
-            sWorldSessionMgr->SendServerMessage(SERVER_MSG_STRING, message);
-            return;
-        }
-
-        if (creature)
-            if (Map* map = creature->GetMap())
-                if (uint32 zoneId = creature->GetZoneId())
-                {
-                    map->SendZoneText(zoneId, message.c_str());
-                    return;
-                }
-
         sWorldSessionMgr->SendServerMessage(SERVER_MSG_STRING, message);
     }
 
@@ -1201,6 +1352,10 @@ namespace
         if (uint32 auraSpell = GetVisualAuraSpell())
             creature->RemoveAurasDueToSpell(auraSpell);
 
+        // Restore original creature name
+        if (CreatureTemplate const* creatureTemplate = creature->GetCreatureTemplate())
+            creature->SetName(creatureTemplate->Name);
+
         creature->UpdateAllStats();
 
         if (creature->IsAlive())
@@ -1317,6 +1472,12 @@ namespace
         return scaledItems;
     }
 
+    // Scale gold by creature level: level 1 = 0.05x, level 40 = 0.5x, level 80 = 1.0x
+    float GetLevelMultiplier(uint8 creatureLevel)
+    {
+        return std::clamp(float(creatureLevel) / 80.0f, 0.05f, 1.0f);
+    }
+
     uint32 GetScaledGold(uint32 baseGold, float multiplier)
     {
         if (!baseGold || multiplier <= 0.0f)
@@ -1325,7 +1486,46 @@ namespace
         return uint32((float(baseGold) * multiplier) + 0.5f);
     }
 
-    void GrantReward(Player* player, bool revenge, uint8 rank, float rewardMultiplier)
+    uint32 GetBonusDropItem()
+    {
+        return sConfigMgr->GetOption<uint32>("NemesisSystem.BonusDrop.Item", 0);
+    }
+
+    float GetBonusDropChancePerRank()
+    {
+        return sConfigMgr->GetOption<float>("NemesisSystem.BonusDrop.ChancePerRank", 35.0f);
+    }
+
+    uint32 GetBonusDropCount()
+    {
+        return sConfigMgr->GetOption<uint32>("NemesisSystem.BonusDrop.Count", 1);
+    }
+
+    void AddItemOrMail(Player* player, uint32 itemId, uint32 count)
+    {
+        if (!player || !itemId || !count)
+            return;
+
+        if (player->AddItem(itemId, count))
+            return;
+
+        // Inventory full — send via mail
+        if (Item* item = Item::CreateItem(itemId, count, player))
+        {
+            CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+            item->SaveToDB(trans);
+            MailDraft("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0] Reward", "Your bags were full. Here are your nemesis rewards.")
+                .AddItem(item)
+                .SendMailTo(trans,
+                    MailReceiver(player, player->GetGUID().GetCounter()),
+                    MailSender(MAIL_CREATURE, 0),
+                    MAIL_CHECK_MASK_NONE, 0);
+            CharacterDatabase.CommitTransaction(trans);
+            ChatHandler(player->GetSession()).PSendSysMessage("Nemesis reward mailed — your bags were full.");
+        }
+    }
+
+    void GrantReward(Player* player, bool revenge, uint8 rank, float rewardMultiplier, uint8 creatureLevel)
     {
         if (!player)
             return;
@@ -1334,13 +1534,22 @@ namespace
         uint32 const baseItemCount = GetRewardCount(revenge) + (GetRewardItemPerRankBonus(revenge) * rankBonusSteps);
         uint32 const itemCount = GetScaledItemCount(baseItemCount, rewardMultiplier);
         uint32 const baseGold = GetRewardGold(revenge) + (GetRewardGoldPerRankBonus(revenge) * rankBonusSteps);
-        uint32 const gold = GetScaledGold(baseGold, rewardMultiplier);
+        float const levelMult = GetLevelMultiplier(creatureLevel);
+        uint32 const gold = GetScaledGold(baseGold, rewardMultiplier * levelMult);
 
         if (uint32 itemId = GetRewardItem(revenge); itemId && itemCount)
-            player->AddItem(itemId, itemCount);
+            AddItemOrMail(player, itemId, itemCount);
 
         if (gold)
             player->ModifyMoney(int32(gold), true);
+
+        // Bonus drop: chance = ChancePerRank * rank (e.g. 35% per rank → rank 1=35%, rank 3=100%, rank 5=capped at 100%)
+        if (uint32 bonusItem = GetBonusDropItem(); bonusItem)
+        {
+            float const dropChance = std::min(GetBonusDropChancePerRank() * float(rank), 100.0f);
+            if (roll_chance_f(dropChance))
+                AddItemOrMail(player, bonusItem, GetBonusDropCount());
+        }
     }
 
     bool IsEligibleNemesisKill(Creature* killer, Player* killed)
@@ -1403,12 +1612,20 @@ namespace
             return false;
 
         NemesisState state;
-        if (TryGetNemesisState(killer->GetSpawnId(), state))
+        bool const alreadyNemesis = TryGetNemesisState(killer->GetSpawnId(), state);
+
+        if (alreadyNemesis)
         {
             if (GetRankUpCooldownRemaining(state) > 0)
                 return false;
 
             if (GetSameVictimCooldownRemaining(state, killed->GetGUID().GetCounter()) > 0)
+                return false;
+        }
+        else
+        {
+            uint32 const maxPerZone = GetMaxPerZone();
+            if (maxPerZone && CountNemesesInZone(killer->GetZoneId()) >= maxPerZone)
                 return false;
         }
 
@@ -1470,6 +1687,14 @@ namespace
         if (uint32 auraSpell = GetVisualAuraSpell())
             if (!creature->HasAura(auraSpell))
                 creature->AddAura(auraSpell, creature);
+
+        // Set unique Russian nemesis name on the creature
+        if (creature->GetSpawnId())
+        {
+            std::string const title = GenerateNemesisTitle(creature->GetSpawnId(), state.creatureEntry);
+            if (!title.empty())
+                creature->SetName(title);
+        }
     }
 
     bool IsBelowEnrageThreshold(Creature* creature)
@@ -1511,12 +1736,21 @@ namespace
         killer->SetFullHealth();
         BroadcastRankFiveNemesisIfPersistent(killer, state);
 
+        // Push nemesis data to the victim (the player who was killed)
+        if (killer->GetSpawnId() && killed)
+        {
+            NemesisAddonView const view = BuildAddonView(killed, killer->GetSpawnId(), state);
+            SendChunkedAddonPayload(killed, BuildAddonEntryPayload("UPSERT_VALIDATED", view));
+        }
+
         if (ShouldAnnounceCreate() && state.rank >= GetAnnounceMinRank())
         {
             bool const reachedRankFive = existed && previousRank < 5 && state.rank >= 5;
+            // [Немезида]: Бесопожар Обжористый достиг ранга 3!
+            // [Немезида]: Бесопожар Обжористый стал(а) немезидой, убив Caraco!
             std::string message = existed
-                ? Acore::StringFormat("[Nemesis]: {} has reached rank {} at ({}). Affixes: {}.", killer->GetName(), state.rank, GetNemesisCoordinates(killer), GetAffixList(state.affixMask))
-                : Acore::StringFormat("[Nemesis]: {} has become a nemesis after slaying {} at ({}). Affixes: {}.", killer->GetName(), killed->GetName(), GetNemesisCoordinates(killer), GetAffixList(state.affixMask));
+                ? Acore::StringFormat("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} \xD0\xB4\xD0\xBE\xD1\x81\xD1\x82\xD0\xB8\xD0\xB3 \xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3\xD0\xB0 {}!", killer->GetName(), state.rank)
+                : Acore::StringFormat("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} \xD1\x81\xD1\x82\xD0\xB0\xD0\xBB(\xD0\xB0) \xD0\xBD\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xBE\xD0\xB9, \xD1\x83\xD0\xB1\xD0\xB8\xD0\xB2 {}!", killer->GetName(), killed->GetName());
             BroadcastNemesisMessage(killer, message, reachedRankFive);
         }
     }
@@ -1550,13 +1784,15 @@ public:
 
         if (rewardMultiplier > 0.0f)
             for (Player* recipient : recipients.players)
-                GrantReward(recipient, revenge, state.rank, rewardMultiplier);
+                GrantReward(recipient, revenge, state.rank, rewardMultiplier, killed->GetLevel());
 
         if (ShouldAnnounceKill() && state.rank >= GetAnnounceMinRank())
         {
+            // [Немезида]: Honktu отомстил(а) Поганоглаз Ненасытный (ранг 1)!
+            // [Немезида]: Fehkadrit устранил(а) Бесошлён Прожорливый (ранг 1)!
             std::string message = revenge
-                ? Acore::StringFormat("[Nemesis]: {} claimed revenge on {} at rank {} near ({}).", killer->GetName(), killed->GetName(), state.rank, GetNemesisCoordinates(killed))
-                : Acore::StringFormat("[Nemesis]: {} claimed the bounty on {} at rank {} near ({}).", killer->GetName(), killed->GetName(), state.rank, GetNemesisCoordinates(killed));
+                ? Acore::StringFormat("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} \xD0\xBE\xD1\x82\xD0\xBC\xD1\x81\xD1\x82\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank)
+                : Acore::StringFormat("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} \xD1\x83\xD1\x81\xD1\x82\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank);
             BroadcastNemesisMessage(killed, message);
         }
     }
@@ -1739,7 +1975,7 @@ public:
             return true;
         }
 
-        SendNemesisBootstrap(player);
+        SendNemesisBootstrap(player, true);
         return true;
     }
 

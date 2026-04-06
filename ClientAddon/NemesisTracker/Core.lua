@@ -35,6 +35,28 @@ NT.data = NT.data or {
     lastReportBySpawnId = {},
 }
 
+local pendingRefresh = false
+
+local function scheduleRefresh()
+    if pendingRefresh then
+        return
+    end
+    pendingRefresh = true
+    NT:ScheduleTimer(function()
+        pendingRefresh = false
+        sortNemeses()
+        if not NT.data.selectedSpawnId and NT.data.ordered[1] then
+            NT.data.selectedSpawnId = NT.data.ordered[1].spawnId
+        end
+        if NT.UI then
+            NT.UI:RefreshAll()
+        end
+        if NT.WorldMap then
+            NT.WorldMap:RefreshWorldMap()
+        end
+    end, 0.2)
+end
+
 local function splitPreserveEmpty(message, delimiter)
     local result = {}
     if message == nil then
@@ -143,22 +165,11 @@ function NT:GetStalenessState(nemesis)
 end
 
 function NT:GetVisibilityAlpha(nemesis)
-    local state = self:GetStalenessState(nemesis)
-    if state == "hidden" then
-        return 0.0
-    end
-    if state == "stale" then
-        return 0.35
-    end
-    if state == "fading" then
-        return 0.6
-    end
-
     return 1.0
 end
 
 function NT:ShouldHideNemesis(nemesis)
-    return self:GetStalenessState(nemesis) == "hidden"
+    return false
 end
 
 local function shouldIncludeNemesis(nemesis)
@@ -546,6 +557,8 @@ function NT:UpsertNemesisFromFields(fields, startIndex, source)
         rewardClass = fields[startIndex + 19] or "none",
         threatClass = fields[startIndex + 20] or "low",
         lastSeenAt = tonumber(fields[startIndex + 21]) or 0,
+        runtimeGuid = fields[startIndex + 22] or "",
+        nemesisTitle = fields[startIndex + 23] or "",
         lastSeenSource = source,
         isAlive = true,
         removeReason = nil,
@@ -589,10 +602,7 @@ function NT:UpsertNemesisFromFields(fields, startIndex, source)
         self.data.selectedSpawnId = spawnId
     end
 
-    sortNemeses()
-    if self.UI then
-        self.UI:RefreshAll()
-    end
+    scheduleRefresh()
 
     return incoming
 end
@@ -611,13 +621,8 @@ function NT:RemoveNemesis(spawnId, reason)
     if self.data.selectedSpawnId == spawnId then
         self.data.selectedSpawnId = nil
     end
-    sortNemeses()
-    if not self.data.selectedSpawnId and self.data.ordered[1] then
-        self.data.selectedSpawnId = self.data.ordered[1].spawnId
-    end
-    if self.UI then
-        self.UI:RefreshAll()
-    end
+
+    scheduleRefresh()
 end
 
 function NT:HandleChunk(message)
@@ -706,7 +711,7 @@ function NT:ShareValidatedNemesis(nemesis)
     end
 
     local message = string.format(
-        "ENT:%d:%d:%s:%d:%d:%s:%.1f:%.1f:%.1f:%.2f:%.2f:%d:%d:%s:%d:%s:%d:%s:%s:%s:%s:%d",
+        "ENT:%d:%d:%s:%d:%d:%s:%.1f:%.1f:%.1f:%.2f:%.2f:%d:%d:%s:%d:%s:%d:%s:%s:%s:%s:%d:%s:%s",
         nemesis.spawnId or 0,
         nemesis.creatureEntry or 0,
         sanitizeField(nemesis.name),
@@ -728,7 +733,9 @@ function NT:ShareValidatedNemesis(nemesis)
         sanitizeField(nemesis.relation),
         sanitizeField(nemesis.rewardClass),
         sanitizeField(nemesis.threatClass),
-        nemesis.lastSeenAt or 0)
+        nemesis.lastSeenAt or 0,
+        sanitizeField(nemesis.runtimeGuid or ""),
+        sanitizeField(nemesis.nemesisTitle or ""))
     self:SendCommMessage(self.peerPrefix, message, distribution, target, "NORMAL")
 end
 
@@ -847,7 +854,7 @@ function NT:InitializeDatabase()
     self.database = LibStub("AceDB-3.0"):New("NemesisTrackerDB", defaults, true)
     self.db = self.database.profile
     self.db.cache = self.db.cache or {}
-    self.db.cache.nemeses = self.db.cache.nemeses or {}
+    self.db.cache.nemeses = {}
     self.data.nemeses = self.db.cache.nemeses
 end
 
@@ -870,6 +877,21 @@ function NT:SlashCommand(input)
         self:RequestPeerSync()
         return
     end
+    if input == "reset" then
+        wipe(self.data.nemeses)
+        wipe(self.data.ordered)
+        self.data.selectedSpawnId = nil
+        self.db.cache.nemeses = self.data.nemeses
+        sortNemeses()
+        if self.UI then
+            self.UI:RefreshAll()
+        end
+        if self.WorldMap then
+            self.WorldMap:RefreshWorldMap()
+        end
+        self:Print("Saved data cleared.")
+        return
+    end
 
     self:ToggleWindow()
 end
@@ -880,6 +902,10 @@ function NT:RefreshVisibleUI()
         self.UI:RefreshList()
         self.UI:RefreshDetails()
         self.UI:RefreshMap()
+    end
+
+    if self.WorldMap then
+        self.WorldMap:RefreshWorldMap()
     end
 end
 
@@ -927,7 +953,7 @@ function NT:RespondToPeerSync(sender)
 
     for _, nemesis in ipairs(self:GetPeerSyncCandidates()) do
         local message = string.format(
-            "ENT:%d:%d:%s:%d:%d:%s:%.1f:%.1f:%.1f:%.2f:%.2f:%d:%d:%s:%d:%s:%d:%s:%s:%s:%s:%d",
+            "ENT:%d:%d:%s:%d:%d:%s:%.1f:%.1f:%.1f:%.2f:%.2f:%d:%d:%s:%d:%s:%d:%s:%s:%s:%s:%d:%s:%s",
             nemesis.spawnId or 0,
             nemesis.creatureEntry or 0,
             sanitizeField(nemesis.name),
@@ -949,7 +975,9 @@ function NT:RespondToPeerSync(sender)
             sanitizeField(nemesis.relation),
             sanitizeField(nemesis.rewardClass),
             sanitizeField(nemesis.threatClass),
-            nemesis.lastSeenAt or 0)
+            nemesis.lastSeenAt or 0,
+            sanitizeField(nemesis.runtimeGuid or ""),
+        sanitizeField(nemesis.nemesisTitle or ""))
         self:SendCommMessage(self.peerPrefix, message, "WHISPER", sender, "BULK")
     end
 
@@ -1029,6 +1057,10 @@ function NT:OnInitialize()
         self.UI:RefreshAll()
     end
 
+    if self.WorldMap then
+        self.WorldMap:Initialize()
+    end
+
     self:RegisterChatCommand("nemesistracker", "SlashCommand")
     self:RegisterChatCommand("ntrack", "SlashCommand")
 
@@ -1042,11 +1074,14 @@ end
 
 function NT:OnEnable()
     self:RegisterEvent("PLAYER_ENTERING_WORLD")
+    self:RegisterEvent("ZONE_CHANGED_NEW_AREA")
     self:RegisterEvent("PLAYER_TARGET_CHANGED")
+    self:RegisterEvent("PLAYER_FOCUS_CHANGED")
     self:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
     self:RegisterEvent("CHAT_MSG_SYSTEM")
     self:RegisterEvent("CHAT_MSG_ADDON")
     self.refreshTimer = self:ScheduleRepeatingTimer("RefreshVisibleUI", 1)
+    self.syncTimer = self:ScheduleRepeatingTimer("AutoSync", 300)
 end
 
 function NT:OnDisable()
@@ -1057,6 +1092,9 @@ function NT:OnDisable()
 end
 
 function NT:PLAYER_ENTERING_WORLD()
+    if self.WorldMap and self.WorldMap.updatePlayerZoneCache then
+        self.WorldMap.updatePlayerZoneCache()
+    end
     self:ScheduleTimer(function()
         if self.db.autoBootstrap then
             self:RequestBootstrap()
@@ -1067,8 +1105,30 @@ function NT:PLAYER_ENTERING_WORLD()
     end, 2)
 end
 
+function NT:ZONE_CHANGED_NEW_AREA()
+    if self.WorldMap and self.WorldMap.updatePlayerZoneCache then
+        self.WorldMap.updatePlayerZoneCache()
+    end
+    self:ScheduleTimer(function()
+        self:RequestBootstrap()
+    end, 3)
+end
+
+function NT:AutoSync()
+    self:RequestBootstrap()
+end
+
 function NT:PLAYER_TARGET_CHANGED()
     self:TrackKnownUnit("target")
+    if self.WorldMap then
+        self.WorldMap:RefreshPortraitIcons()
+    end
+end
+
+function NT:PLAYER_FOCUS_CHANGED()
+    if self.WorldMap then
+        self.WorldMap:RefreshPortraitIcons()
+    end
 end
 
 function NT:UPDATE_MOUSEOVER_UNIT()
@@ -1077,7 +1137,15 @@ end
 
 function NT:CHAT_MSG_SYSTEM(_, message)
     self:HandleSystemMessage(message)
+
+    -- Trigger sync when a nemesis announcement appears in chat
+    if message and (string.find(message, "[Nemesis]", 1, true) or string.find(message, "Немезида", 1, true)) then
+        self:ScheduleTimer(function()
+            self:RequestBootstrap()
+        end, 2)
+    end
 end
+
 
 function NT:CHAT_MSG_ADDON(_, prefix, message)
     if prefix == self.prefix then
