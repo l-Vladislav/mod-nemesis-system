@@ -369,3 +369,27 @@ NemesisSystem.AddonBootstrapMaxEntries = 100
 #
 
 NemesisSystem.AddonReportCooldownSeconds = 30
+
+########################################
+# BOUNTY VENDOR
+########################################
+
+#
+#    NemesisSystem.BountyVendor.Enable
+#        Description: Adds a "Bounty Hunter Rewards" gossip option to all
+#                     innkeepers, opening a vendor window where players can
+#                     spend Nemesis Bounty Tokens.
+#        Default:     1 - Enabled
+#                     0 - Disabled
+#
+
+NemesisSystem.BountyVendor.Enable = 1
+
+#
+#    NemesisSystem.BountyVendor.Entry
+#        Description: The npc_vendor entry used for the bounty vendor inventory.
+#                     All innkeepers share this vendor entry.
+#        Default:     190000
+#
+
+NemesisSystem.BountyVendor.Entry = 190000

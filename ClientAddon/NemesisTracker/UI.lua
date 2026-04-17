@@ -557,13 +557,16 @@ function UI:CreateRow(parent, index)
 
         local nemesis = button.nemesis
         GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
-        GameTooltip:SetText(nemesis.name or "Nemesis")
-        GameTooltip:AddLine(string.format("Level %d  Rank %d - %s", nemesis.level or 0, nemesis.rank or 1, nemesis.rankTier or "Marked"), 1, 1, 1)
-        GameTooltip:AddLine(string.format("Relation: %s", nemesis.relation or "public"), 0.7, 0.9, 1)
-        GameTooltip:AddLine(string.format("Reward: %s  Threat: %s", nemesis.rewardClass or "none", nemesis.threatClass or "low"), 1, 0.82, 0.2)
-        GameTooltip:AddLine(string.format("Zone: %s", nemesis.zoneName or "Unknown"), 0.85, 0.85, 0.85)
-        GameTooltip:AddLine("Last Seen: " .. self:FormatLastSeen(nemesis.lastSeenAt), 0.7, 0.9, 0.7)
-        GameTooltip:AddLine(string.format("Status: %s  Source: %s", NT:GetStalenessState(nemesis), nemesis.lastSeenSource or "unknown"), 0.8, 0.8, 0.8)
+        local rowTitle = nemesis.nemesisTitle or ""
+        if rowTitle == "" then
+            rowTitle = nemesis.name or "Немезида"
+        end
+        GameTooltip:SetText(string.format("|cffff4444%s", rowTitle))
+        if NT.WorldMap and NT.WorldMap.RenderTooltipBlock then
+            NT.WorldMap.RenderTooltipBlock(GameTooltip, nemesis, {
+                showLevel = true, showZone = true,
+            })
+        end
         GameTooltip:Show()
     end)
 

@@ -7,6 +7,8 @@
 #include "Creature.h"
 #include "DBCStores.h"
 #include "DatabaseEnv.h"
+#include "Formulas.h"
+#include "GameEventMgr.h"
 #include "GameTime.h"
 #include "Group.h"
 #include "GuildMgr.h"
@@ -17,9 +19,11 @@
 #include "Mail.h"
 #include "Player.h"
 #include "Random.h"
+#include "ScriptedGossip.h"
 #include "ScriptMgr.h"
 #include "UnitScript.h"
 #include "WorldPacket.h"
+#include "WorldSession.h"
 #include "WorldSessionMgr.h"
 
 #ifdef MOD_PLAYERBOTS
@@ -81,6 +85,7 @@ namespace
         ObjectGuid::LowType spawnId = 0;
         uint32 creatureEntry = 0;
         std::string name;
+        std::string localizedName;
         uint32 mapId = 0;
         uint32 zoneId = 0;
         std::string zoneName;
@@ -105,7 +110,7 @@ namespace
     };
 
     // Nemesis title generator — deterministic from spawnId + creatureEntry
-    // Russian nemesis name generator: 40 prefixes x 40 suffixes x 25 titles = 40,000 combinations
+    // Russian nemesis name generator: 60 prefixes x 60 suffixes x 40 titles = 144,000 combinations
     static constexpr char const* NemesisPrefixes[] = {
         "\xD0\x9A\xD1\x80\xD0\xBE\xD0\xB2\xD0\xBE",       // Кровo
         "\xD0\xA2\xD0\xB5\xD0\xBD\xD0\xB5",                 // Тене
@@ -146,7 +151,27 @@ namespace
         "\xD0\xA5\xD0\xB0\xD0\xBE\xD1\x81\xD0\xBE",         // Хаосо
         "\xD0\x91\xD0\xB5\xD1\x81\xD0\xBE",                 // Бесо
         "\xD0\x9F\xD1\x80\xD0\xBE\xD0\xBA\xD0\xBB\xD1\x8F\xD1\x82\xD0\xBE", // Проклято
-        "\xD0\xA2\xD1\x80\xD1\x83\xD0\xBF\xD0\xBE"          // Трупо
+        "\xD0\xA2\xD1\x80\xD1\x83\xD0\xBF\xD0\xBE",         // Трупо
+        "\xD0\xA7\xD0\xB5\xD1\x80\xD0\xBD\xD0\xBE",         // Черно
+        "\xD0\x94\xD1\x83\xD1\x88\xD0\xB5",                 // Душе
+        "\xD0\x97\xD0\xB2\xD0\xB5\xD1\x80\xD0\xBE",         // Зверо
+        "\xD0\x9A\xD0\xB0\xD0\xBC\xD0\xBD\xD0\xB5",         // Камне
+        "\xD0\xA7\xD0\xB5\xD1\x80\xD0\xB2\xD0\xB5",         // Черве
+        "\xD0\xA1\xD1\x82\xD0\xB5\xD1\x80\xD0\xB2\xD0\xBE", // Стерво
+        "\xD0\x9A\xD1\x80\xD1\x8B\xD1\x81\xD0\xBE",         // Крысо
+        "\xD0\x9F\xD0\xB0\xD1\x83\xD0\xBA\xD0\xBE",         // Пауко
+        "\xD0\x93\xD1\x80\xD1\x8F\xD0\xB7\xD0\xB5",         // Грязе
+        "\xD0\x9C\xD0\xBE\xD0\xB3\xD0\xB8\xD0\xBB\xD0\xBE", // Могило
+        "\xD0\x9E\xD1\x81\xD1\x82\xD1\x80\xD0\xBE",         // Остро
+        "\xD0\x9C\xD1\x8F\xD1\x81\xD0\xBE",                 // Мясо
+        "\xD0\x96\xD0\xB8\xD0\xBB\xD0\xBE",                 // Жило
+        "\xD0\x93\xD1\x80\xD0\xBE\xD0\xB1\xD0\xBE",         // Гробо
+        "\xD0\xA1\xD0\xBA\xD0\xBE\xD1\x80\xD0\xB1\xD0\xBE", // Скорбо
+        "\xD0\x92\xD0\xBE\xD1\x80\xD0\xBE\xD0\xBD\xD0\xBE", // Вороно
+        "\xD0\x9A\xD0\xBE\xD1\x88\xD0\xBC\xD0\xB0\xD1\x80\xD0\xBE", // Кошмаро
+        "\xD0\x91\xD1\x80\xD0\xB8\xD1\x82\xD0\xB2\xD0\xBE", // Бритво
+        "\xD0\xA3\xD1\x82\xD1\x80\xD0\xBE\xD0\xB1\xD0\xBE", // Утробо
+        "\xD0\x9C\xD0\xB5\xD1\x80\xD1\x82\xD0\xB2\xD0\xBE"  // Мертво
     };
 
     static constexpr char const* NemesisSuffixes[] = {
@@ -189,7 +214,27 @@ namespace
         "\xD0\xBA\xD1\x83\xD1\x81",           // кус
         "\xD0\xBF\xD1\x80\xD1\x8B\xD1\x89",   // прыщ
         "\xD0\xBF\xD1\x83\xD0\xBA\xD1\x81",   // пукс
-        "\xD1\x88\xD0\xBB\xD1\x91\xD0\xBF"    // шлёп
+        "\xD1\x88\xD0\xBB\xD1\x91\xD0\xBF",   // шлёп
+        "\xD0\xBA\xD1\x80\xD0\xB8\xD0\xBA",   // крик
+        "\xD1\x81\xD1\x82\xD0\xBE\xD0\xBD",   // стон
+        "\xD0\xBF\xD0\xBB\xD1\x91\xD0\xB2",   // плёв
+        "\xD1\x81\xD0\xBB\xD1\x8E\xD0\xBD",   // слюн
+        "\xD0\xB4\xD1\x8B\xD1\x85",           // дых
+        "\xD0\xB4\xD1\x91\xD1\x80",           // дёр
+        "\xD1\x81\xD0\xBA\xD0\xBE\xD0\xBA",   // скок
+        "\xD0\xB3\xD0\xBD\xD0\xB8\xD0\xBB\xD1\x8C", // гниль
+        "\xD0\xBC\xD0\xBE\xD0\xBB\xD0\xBE\xD1\x82", // молот
+        "\xD1\x86\xD0\xB0\xD0\xBF",           // цап
+        "\xD0\xB3\xD0\xB0\xD0\xB4",           // гад
+        "\xD0\xBB\xD1\x8F\xD0\xB7\xD0\xB3",   // лязг
+        "\xD0\xB3\xD0\xBE\xD1\x80\xD0\xB1",   // горб
+        "\xD0\xB3\xD0\xB0\xD1\x80\xD1\x8C",   // гарь
+        "\xD0\xB3\xD0\xBD\xD0\xBE\xD0\xB9",   // гной
+        "\xD0\xB6\xD1\x91\xD0\xBB\xD1\x87\xD1\x8C", // жёлчь
+        "\xD1\x85\xD1\x80\xD1\x8F\xD1\x89",   // хрящ
+        "\xD0\xBC\xD0\xBE\xD1\x85",           // мох
+        "\xD1\x81\xD0\xBA\xD1\x80\xD0\xB8\xD0\xBF", // скрип
+        "\xD0\xB3\xD1\x83\xD0\xBB"            // гул
     };
 
     static constexpr char const* NemesisTitles[] = {
@@ -217,7 +262,22 @@ namespace
         "\xD0\x9E\xD0\xB1\xD0\xB6\xD0\xBE\xD1\x80\xD0\xB8\xD1\x81\xD1\x82\xD1\x8B\xD0\xB9", // Обжористый
         "\xD0\x97\xD0\xB0\xD0\xBF\xD0\xBB\xD0\xB5\xD1\x81\xD0\xBD\xD0\xB5\xD0\xB2\xD0\xB5\xD0\xBB\xD1\x8B\xD0\xB9", // Заплесневелый
         "\xD0\x9F\xD1\x80\xD0\xBE\xD0\xB6\xD0\xBE\xD1\x80\xD0\xBB\xD0\xB8\xD0\xB2\xD1\x8B\xD0\xB9", // Прожорливый
-        "\xD0\x91\xD1\x83\xD0\xB9\xD0\xBD\xD1\x8B\xD0\xB9"  // Буйный
+        "\xD0\x91\xD1\x83\xD0\xB9\xD0\xBD\xD1\x8B\xD0\xB9", // Буйный
+        "\xD0\x91\xD0\xB5\xD0\xB7\xD1\x83\xD0\xBC\xD0\xBD\xD1\x8B\xD0\xB9", // Безумный
+        "\xD0\x93\xD0\xBE\xD0\xBB\xD0\xBE\xD0\xB4\xD0\xBD\xD1\x8B\xD0\xB9", // Голодный
+        "\xD0\x93\xD0\xBD\xD0\xB8\xD0\xBB\xD0\xBE\xD0\xB9", // Гнилой
+        "\xD0\x9C\xD1\x80\xD0\xB0\xD1\x87\xD0\xBD\xD1\x8B\xD0\xB9", // Мрачный
+        "\xD0\xAF\xD0\xB4\xD0\xBE\xD0\xB2\xD0\xB8\xD1\x82\xD1\x8B\xD0\xB9", // Ядовитый
+        "\xD0\x91\xD0\xB5\xD1\x81\xD1\x81\xD0\xBC\xD0\xB5\xD1\x80\xD1\x82\xD0\xBD\xD1\x8B\xD0\xB9", // Бессмертный
+        "\xD0\x9E\xD1\x82\xD0\xB2\xD1\x80\xD0\xB0\xD1\x82\xD0\xB8\xD1\x82\xD0\xB5\xD0\xBB\xD1\x8C\xD0\xBD\xD1\x8B\xD0\xB9", // Отвратительный
+        "\xD0\x93\xD0\xB0\xD0\xB4\xD0\xBA\xD0\xB8\xD0\xB9", // Гадкий
+        "\xD0\x9A\xD0\xBE\xD1\x81\xD1\x82\xD0\xBB\xD1\x8F\xD0\xB2\xD1\x8B\xD0\xB9", // Костлявый
+        "\xD0\xA5\xD1\x80\xD0\xBE\xD0\xBC\xD0\xBE\xD0\xB9", // Хромой
+        "\xD0\xA1\xD0\xBB\xD0\xB5\xD0\xBF\xD0\xBE\xD0\xB9", // Слепой
+        "\xD0\xA7\xD1\x83\xD0\xBC\xD0\xBD\xD0\xBE\xD0\xB9", // Чумной
+        "\xD0\xA1\xD0\xBC\xD1\x80\xD0\xB0\xD0\xB4\xD0\xBD\xD1\x8B\xD0\xB9", // Смрадный
+        "\xD0\x9D\xD0\xB5\xD0\xBD\xD0\xB0\xD0\xB2\xD0\xB8\xD1\x81\xD1\x82\xD0\xBD\xD1\x8B\xD0\xB9", // Ненавистный
+        "\xD0\x9A\xD1\x80\xD0\xB8\xD0\xB2\xD0\xBE\xD0\xB9"  // Кривой
     };
 
     std::string GenerateNemesisTitle(ObjectGuid::LowType spawnId, uint32 creatureEntry)
@@ -607,6 +667,23 @@ namespace
         }
     }
 
+    std::string GetLocalizedCreatureName(Player* player, uint32 entry)
+    {
+        CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(entry);
+        if (!ct)
+            return "";
+
+        std::string name = ct->Name;
+        if (player && player->GetSession())
+        {
+            LocaleConstant loc_idx = player->GetSession()->GetSessionDbLocaleIndex();
+            if (loc_idx >= 0)
+                if (CreatureLocale const* cl = sObjectMgr->GetCreatureLocale(entry))
+                    ObjectMgr::GetLocaleString(cl->Name, loc_idx, name);
+        }
+        return name;
+    }
+
     std::string GetZoneName(uint32 zoneId)
     {
         if (!zoneId)
@@ -750,6 +827,7 @@ namespace
         view.spawnId = spawnId;
         view.creatureEntry = state.creatureEntry;
         view.nemesisTitle = SanitizeAddonField(GenerateNemesisTitle(spawnId, state.creatureEntry));
+        view.localizedName = SanitizeAddonField(GetLocalizedCreatureName(player, state.creatureEntry));
         view.mapId = state.mapId;
         view.zoneId = state.zoneId;
         view.zoneName = SanitizeAddonField(GetZoneName(state.zoneId));
@@ -809,7 +887,7 @@ namespace
     std::string BuildAddonEntryPayload(char const* opcode, NemesisAddonView const& view)
     {
         return Acore::StringFormat(
-            "V2:{}:{}:{}:{}:{}:{}:{}:{:.1f}:{:.1f}:{:.1f}:{:.2f}:{:.2f}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "V2:{}:{}:{}:{}:{}:{}:{}:{:.1f}:{:.1f}:{:.1f}:{:.2f}:{:.2f}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             opcode,
             uint64(view.spawnId),
             view.creatureEntry,
@@ -834,7 +912,8 @@ namespace
             view.threatClass,
             view.lastSeenAt,
             view.runtimeGuid,
-            view.nemesisTitle);
+            view.nemesisTitle,
+            view.localizedName);
     }
 
     std::string BuildHelloPayload(uint32 entryCount)
@@ -1531,25 +1610,34 @@ namespace
             return;
 
         uint32 const rankBonusSteps = rank > 0 ? uint32(rank - 1) : 0;
-        uint32 const baseItemCount = GetRewardCount(revenge) + (GetRewardItemPerRankBonus(revenge) * rankBonusSteps);
-        uint32 const itemCount = GetScaledItemCount(baseItemCount, rewardMultiplier);
+
+        // Token reward: guaranteed if creature is not gray (green or higher)
+        // No tokens at all if the creature is gray (trivial)
+        // Gray creatures give no item rewards at all (tokens or bonus drops)
+        bool const isGray = creatureLevel <= Acore::XP::GetGrayLevel(player->GetLevel());
+        if (!isGray)
+        {
+            // Token reward: guaranteed for green or higher
+            uint32 const itemCount = GetRewardCount(revenge) + (GetRewardItemPerRankBonus(revenge) * rankBonusSteps);
+            if (uint32 itemId = GetRewardItem(revenge); itemId && itemCount)
+                AddItemOrMail(player, itemId, itemCount);
+
+            // Bonus drop: chance = ChancePerRank * rank (e.g. 20% per rank → rank 1=20%, rank 5=100%)
+            if (uint32 bonusItem = GetBonusDropItem(); bonusItem)
+            {
+                float const dropChance = std::min(GetBonusDropChancePerRank() * float(rank), 100.0f);
+                if (roll_chance_f(dropChance))
+                    AddItemOrMail(player, bonusItem, GetBonusDropCount());
+            }
+        }
+
+        // Gold still scales by level difference and creature level
         uint32 const baseGold = GetRewardGold(revenge) + (GetRewardGoldPerRankBonus(revenge) * rankBonusSteps);
         float const levelMult = GetLevelMultiplier(creatureLevel);
         uint32 const gold = GetScaledGold(baseGold, rewardMultiplier * levelMult);
 
-        if (uint32 itemId = GetRewardItem(revenge); itemId && itemCount)
-            AddItemOrMail(player, itemId, itemCount);
-
         if (gold)
             player->ModifyMoney(int32(gold), true);
-
-        // Bonus drop: chance = ChancePerRank * rank (e.g. 35% per rank → rank 1=35%, rank 3=100%, rank 5=capped at 100%)
-        if (uint32 bonusItem = GetBonusDropItem(); bonusItem)
-        {
-            float const dropChance = std::min(GetBonusDropChancePerRank() * float(rank), 100.0f);
-            if (roll_chance_f(dropChance))
-                AddItemOrMail(player, bonusItem, GetBonusDropCount());
-        }
     }
 
     bool IsEligibleNemesisKill(Creature* killer, Player* killed)
@@ -1782,9 +1870,8 @@ public:
         RewardRecipients const recipients = CollectRewardRecipients(killer, killed);
         float const rewardMultiplier = GetRewardMultiplier(killed->GetLevel(), recipients.highestLevel);
 
-        if (rewardMultiplier > 0.0f)
-            for (Player* recipient : recipients.players)
-                GrantReward(recipient, revenge, state.rank, rewardMultiplier, killed->GetLevel());
+        for (Player* recipient : recipients.players)
+            GrantReward(recipient, revenge, state.rank, rewardMultiplier, killed->GetLevel());
 
         if (ShouldAnnounceKill() && state.rank >= GetAnnounceMinRank())
         {
@@ -2319,10 +2406,135 @@ public:
     }
 };
 
+// ────────────────────────────────────────────────────────────────────────────
+// Bounty Vendor — adds "Bounty Hunter Rewards" gossip option to all innkeepers
+// ────────────────────────────────────────────────────────────────────────────
+
+class NemesisBountyVendorScript : public AllCreatureScript
+{
+    // Innkeeper gossip constants (mirrors npc_innkeeper.cpp)
+    static constexpr uint32 INNKEEPER_GOSSIP_MENU    = 9733;
+    static constexpr uint32 INNKEEPER_GOSSIP_EVENT   = 342;
+    static constexpr uint32 SPELL_TRICK              = 24714;
+    static constexpr uint32 SPELL_TREAT              = 24715;
+    static constexpr uint32 SPELL_TRICKED_OR_TREATED = 24755;
+    static constexpr uint32 HALLOWEEN_EVENTID        = 12;
+
+    // Our custom action
+    static constexpr uint32 BOUNTY_GOSSIP_ACTION = GOSSIP_ACTION_INFO_DEF + 9000;
+
+public:
+    NemesisBountyVendorScript() : AllCreatureScript("NemesisBountyVendorScript") { }
+
+    bool CanCreatureGossipHello(Player* player, Creature* creature) override
+    {
+        if (!creature->IsInnkeeper())
+            return false;
+
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
+            return false;
+
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.BountyVendor.Enable", true))
+            return false;
+
+        // Replicate npc_innkeeper OnGossipHello + add bounty option
+        ClearGossipMenuFor(player);
+
+        // Halloween event option
+        if (IsEventActive(HALLOWEEN_EVENTID) && !player->HasAura(SPELL_TRICKED_OR_TREATED))
+            AddGossipItemFor(player, INNKEEPER_GOSSIP_EVENT, 0,
+                GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INFO_DEF + HALLOWEEN_EVENTID);
+
+        // Quest giver
+        if (creature->IsQuestGiver())
+            player->PrepareQuestMenu(creature->GetGUID());
+
+        // Vendor (existing innkeeper vendor items)
+        if (creature->IsVendor())
+            AddGossipItemFor(player, INNKEEPER_GOSSIP_MENU, 2,
+                GOSSIP_SENDER_MAIN, GOSSIP_ACTION_TRADE);
+
+        // Make this inn your home
+        if (creature->IsInnkeeper())
+            AddGossipItemFor(player, INNKEEPER_GOSSIP_MENU, 1,
+                GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INN);
+
+        // ── Bounty Hunter Rewards ──
+        AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
+            "\u041d\u0430\u0433\u0440\u0430\u0434\u044b \u043e\u0445\u043e\u0442\u043d\u0438\u043a\u0430 \u0437\u0430 \u0433\u043e\u043b\u043e\u0432\u0430\u043c\u0438",  // Награды охотника за головами
+            GOSSIP_SENDER_MAIN, BOUNTY_GOSSIP_ACTION);
+
+        player->TalkedToCreature(creature->GetEntry(), creature->GetGUID());
+        SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
+        return true;
+    }
+
+    bool CanCreatureGossipSelect(Player* player, Creature* creature,
+        uint32 sender, uint32 action) override
+    {
+        if (!creature->IsInnkeeper())
+            return false;
+
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
+            return false;
+
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.BountyVendor.Enable", true))
+            return false;
+
+        ClearGossipMenuFor(player);
+
+        // Halloween trick-or-treat
+        if (action == GOSSIP_ACTION_INFO_DEF + HALLOWEEN_EVENTID
+            && IsEventActive(HALLOWEEN_EVENTID)
+            && !player->HasAura(SPELL_TRICKED_OR_TREATED))
+        {
+            player->CastSpell(player, SPELL_TRICKED_OR_TREATED, true);
+            creature->CastSpell(player, roll_chance_i(50) ? SPELL_TRICK : SPELL_TREAT, true);
+            CloseGossipMenuFor(player);
+            return true;
+        }
+
+        // ── Bounty vendor ──
+        if (action == BOUNTY_GOSSIP_ACTION)
+        {
+            uint32 vendorEntry = sConfigMgr->GetOption<uint32>(
+                "NemesisSystem.BountyVendor.Entry", 190000);
+
+            // Temporarily grant vendor flag so SendListInventory succeeds
+            bool hadVendorFlag = creature->HasNpcFlag(UNIT_NPC_FLAG_VENDOR);
+            if (!hadVendorFlag)
+                creature->SetNpcFlag(UNIT_NPC_FLAG_VENDOR);
+
+            player->GetSession()->SendListInventory(creature->GetGUID(), vendorEntry);
+
+            if (!hadVendorFlag)
+                creature->RemoveNpcFlag(UNIT_NPC_FLAG_VENDOR);
+
+            return true;
+        }
+
+        // Default innkeeper actions
+        CloseGossipMenuFor(player);
+
+        switch (action)
+        {
+            case GOSSIP_ACTION_TRADE:
+                player->GetSession()->SendListInventory(creature->GetGUID());
+                break;
+            case GOSSIP_ACTION_INN:
+                player->SetBindPoint(creature->GetGUID());
+                break;
+        }
+
+        return true;
+    }
+};
+
 void AddSC_mod_nemesis_system()
 {
     new NemesisSystemPlayerScript();
     new NemesisSystemAllCreatureScript();
     new NemesisSystemUnitScript();
     new NemesisSystemCommandScript();
+    new NemesisBountyVendorScript();
 }

@@ -36,6 +36,7 @@ NT.data = NT.data or {
 }
 
 local pendingRefresh = false
+local sortNemeses
 
 local function scheduleRefresh()
     if pendingRefresh then
@@ -201,7 +202,7 @@ local function shouldIncludeNemesis(nemesis)
     return true
 end
 
-local function sortNemeses()
+sortNemeses = function()
     wipe(NT.data.ordered)
     for _, nemesis in pairs(NT.data.nemeses) do
         if shouldIncludeNemesis(nemesis) then
@@ -559,6 +560,7 @@ function NT:UpsertNemesisFromFields(fields, startIndex, source)
         lastSeenAt = tonumber(fields[startIndex + 21]) or 0,
         runtimeGuid = fields[startIndex + 22] or "",
         nemesisTitle = fields[startIndex + 23] or "",
+        localizedName = fields[startIndex + 24] or "",
         lastSeenSource = source,
         isAlive = true,
         removeReason = nil,
@@ -711,7 +713,7 @@ function NT:ShareValidatedNemesis(nemesis)
     end
 
     local message = string.format(
-        "ENT:%d:%d:%s:%d:%d:%s:%.1f:%.1f:%.1f:%.2f:%.2f:%d:%d:%s:%d:%s:%d:%s:%s:%s:%s:%d:%s:%s",
+        "ENT:%d:%d:%s:%d:%d:%s:%.1f:%.1f:%.1f:%.2f:%.2f:%d:%d:%s:%d:%s:%d:%s:%s:%s:%s:%d:%s:%s:%s",
         nemesis.spawnId or 0,
         nemesis.creatureEntry or 0,
         sanitizeField(nemesis.name),
@@ -735,7 +737,8 @@ function NT:ShareValidatedNemesis(nemesis)
         sanitizeField(nemesis.threatClass),
         nemesis.lastSeenAt or 0,
         sanitizeField(nemesis.runtimeGuid or ""),
-        sanitizeField(nemesis.nemesisTitle or ""))
+        sanitizeField(nemesis.nemesisTitle or ""),
+        sanitizeField(nemesis.localizedName or ""))
     self:SendCommMessage(self.peerPrefix, message, distribution, target, "NORMAL")
 end
 
@@ -953,7 +956,7 @@ function NT:RespondToPeerSync(sender)
 
     for _, nemesis in ipairs(self:GetPeerSyncCandidates()) do
         local message = string.format(
-            "ENT:%d:%d:%s:%d:%d:%s:%.1f:%.1f:%.1f:%.2f:%.2f:%d:%d:%s:%d:%s:%d:%s:%s:%s:%s:%d:%s:%s",
+            "ENT:%d:%d:%s:%d:%d:%s:%.1f:%.1f:%.1f:%.2f:%.2f:%d:%d:%s:%d:%s:%d:%s:%s:%s:%s:%d:%s:%s:%s",
             nemesis.spawnId or 0,
             nemesis.creatureEntry or 0,
             sanitizeField(nemesis.name),
@@ -977,7 +980,8 @@ function NT:RespondToPeerSync(sender)
             sanitizeField(nemesis.threatClass),
             nemesis.lastSeenAt or 0,
             sanitizeField(nemesis.runtimeGuid or ""),
-        sanitizeField(nemesis.nemesisTitle or ""))
+            sanitizeField(nemesis.nemesisTitle or ""),
+            sanitizeField(nemesis.localizedName or ""))
         self:SendCommMessage(self.peerPrefix, message, "WHISPER", sender, "BULK")
     end
 

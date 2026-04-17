@@ -18,6 +18,7 @@ local listPanel = nil
 local listScrollOffset = 0
 local hoveredPin = nil
 local pinOverlay = nil
+local findNemesisByUnit
 
 local function threatColor(threat)
     if threat == "extreme" then
@@ -46,6 +47,107 @@ local function rankColor(rank)
 end
 
 local SELECTED_PIN_SIZE = PIN_SIZE * 2
+
+----------------------------------------------------------------
+-- Russian localization + RP flavor for nemesis tooltips
+----------------------------------------------------------------
+
+local RANK_TIER_RU = {
+    Marked     = "Меченый",
+    Hated      = "Ненавистный",
+    Relentless = "Неумолимый",
+    Legendary  = "Легендарный",
+    Mythic     = "Мифический",
+}
+
+local AFFIX_RU = {
+    Vampiric     = "Кровопийца",
+    Swift        = "Стремительный",
+    Juggernaut   = "Несокрушимый",
+    Savage       = "Свирепый",
+    Spellward    = "Защитник от чар",
+    Enraged      = "Разъярённый",
+    Regenerating = "Регенерирующий",
+    None         = "Нет",
+}
+
+local THREAT_RU = {
+    low     = "слабая",
+    medium  = "средняя",
+    high    = "высокая",
+    extreme = "смертельная",
+}
+
+local REWARD_RU = {
+    none    = "нет",
+    revenge = "месть",
+    shared  = "союзная охота",
+    bounty  = "охота за головой",
+}
+
+local ROMAN = { "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X" }
+
+local function toRoman(n)
+    if not n or n < 1 then
+        return "?"
+    end
+    return ROMAN[n] or tostring(n)
+end
+
+local function translateAffixes(text)
+    if not text or text == "" or text == "None" then
+        return nil
+    end
+    local parts = {}
+    for word in string.gmatch(text, "[^,%s]+") do
+        table.insert(parts, AFFIX_RU[word] or word)
+    end
+    if #parts == 0 then
+        return nil
+    end
+    return table.concat(parts, ", ")
+end
+
+-- Appends RP-styled Russian nemesis info to an already-opened tooltip.
+-- Caller is expected to have set the top line (creature title / name).
+-- opts: { showLevel=bool, showZone=bool, showReward=bool }
+-- showReward defaults to true; others default to false.
+function WM.RenderTooltipBlock(tooltip, nemesis, opts)
+    if not tooltip or not nemesis then
+        return
+    end
+    opts = opts or {}
+
+    local tier = nemesis.rankTier or "Marked"
+    local tierRu = RANK_TIER_RU[tier] or tier
+    local rank = nemesis.rank or 1
+
+    if opts.showLevel then
+        tooltip:AddLine(string.format("Уровень %d  |  Ранг %s — %s",
+            nemesis.level or 0, toRoman(rank), tierRu), 1, 0.82, 0)
+    else
+        tooltip:AddLine(string.format("Ранг %s — %s",
+            toRoman(rank), tierRu), 1, 0.82, 0)
+    end
+
+    if opts.showZone and nemesis.zoneName and nemesis.zoneName ~= "" then
+        tooltip:AddLine("Зона: " .. nemesis.zoneName, 0.7, 0.7, 0.7)
+    end
+
+    local affixes = translateAffixes(nemesis.affixText)
+    if affixes then
+        tooltip:AddLine("Способности: " .. affixes, 1.0, 0.6, 0.2)
+    end
+
+    local tr, tg, tb = threatColor(nemesis.threatClass)
+    tooltip:AddLine("Угроза: " .. (THREAT_RU[nemesis.threatClass]
+        or nemesis.threatClass or ""), tr, tg, tb)
+
+    if opts.showReward ~= false then
+        tooltip:AddLine("Награда: " .. (REWARD_RU[nemesis.rewardClass]
+            or nemesis.rewardClass or ""), 0.9, 0.85, 0.3)
+    end
+end
 
 -- Get the internal map file name for the current zone.
 -- GetMapInfo() returns a locale-independent file name like "Silverpine",
@@ -275,28 +377,11 @@ local function createWorldPin(index)
             title = nemesis.name or "Unknown"
         end
         tooltip:SetText(string.format("|cffff4444%s", title))
-        if nemesis.name and nemesis.name ~= "" and nemesis.name ~= title then
-            tooltip:AddLine(nemesis.name, 0.7, 0.7, 0.7)
+        local pinBaseName = nemesis.localizedName or nemesis.name or ""
+        if pinBaseName ~= "" and pinBaseName ~= title then
+            tooltip:AddLine(pinBaseName, 0.75, 0.75, 0.75)
         end
-        tooltip:AddLine(string.format("Level %d  |  Rank %d - %s",
-            nemesis.level or 0, nemesis.rank or 1, nemesis.rankTier or "Marked"), 1, 1, 1)
-        tooltip:AddLine("Zone: " .. (nemesis.zoneName or "Unknown"), 0.7, 0.7, 0.7)
-        if nemesis.affixText and nemesis.affixText ~= "None" then
-            tooltip:AddLine("Affixes: " .. nemesis.affixText, 1.0, 0.6, 0.2)
-        end
-        local tr, tg, tb = threatColor(nemesis.threatClass)
-        tooltip:AddLine("Threat: " .. (nemesis.threatClass or "low"), tr, tg, tb)
-        if nemesis.targetName and nemesis.targetName ~= "" then
-            tooltip:AddLine("Hunts: " .. nemesis.targetName, 1.0, 0.3, 0.3)
-        end
-        local mx = nemesis.mapX or 0
-        local my = nemesis.mapY or 0
-        if mx > 0 and my > 0 then
-            tooltip:AddLine(string.format("Coords: %.1f, %.1f", mx * 100, my * 100), 0.7, 0.7, 0.7)
-        end
-        if NT.UI then
-            tooltip:AddLine("Last Seen: " .. NT.UI:FormatLastSeen(nemesis.lastSeenAt), 0.7, 0.9, 0.7)
-        end
+        WM.RenderTooltipBlock(tooltip, nemesis, { showLevel = true })
         tooltip:Show()
     end)
 
@@ -347,20 +432,7 @@ local function createListRow(parent, index)
             listTitle = nemesis.name or "Unknown"
         end
         GameTooltip:SetText(string.format("|cffff4444%s", listTitle))
-        GameTooltip:AddLine(string.format("Level %d  |  Rank %d - %s",
-            nemesis.level or 0, nemesis.rank or 1, nemesis.rankTier or "Marked"), 1, 1, 1)
-        GameTooltip:AddLine("Zone: " .. (nemesis.zoneName or "Unknown"), 0.7, 0.7, 0.7)
-        if nemesis.affixText and nemesis.affixText ~= "None" then
-            GameTooltip:AddLine("Affixes: " .. nemesis.affixText, 1.0, 0.6, 0.2)
-        end
-        local tr, tg, tb = threatColor(nemesis.threatClass)
-        GameTooltip:AddLine("Threat: " .. (nemesis.threatClass or "low"), tr, tg, tb)
-        if nemesis.targetName and nemesis.targetName ~= "" then
-            GameTooltip:AddLine("Hunts: " .. nemesis.targetName, 1.0, 0.3, 0.3)
-        end
-        if NT.UI then
-            GameTooltip:AddLine("Last Seen: " .. NT.UI:FormatLastSeen(nemesis.lastSeenAt), 0.7, 0.9, 0.7)
-        end
+        WM.RenderTooltipBlock(GameTooltip, nemesis, { showLevel = true })
         GameTooltip:Show()
     end)
 
@@ -736,61 +808,23 @@ function WM:HookTooltips()
     end
     self.tooltipHooked = true
 
-    local function addNemesisTooltip(unit)
-        if not unit or not UnitExists(unit) then
-            return
-        end
-
-        local nemesis = findNemesisByUnit(unit)
-        if not nemesis then
-            return
-        end
-        GameTooltip:AddLine(" ")
-        local unitTitle = nemesis.nemesisTitle or ""
-        if unitTitle ~= "" then
-            GameTooltip:AddLine(string.format("|cffff4444%s", unitTitle))
-        end
-        GameTooltip:AddLine(string.format("Rank %d - %s",
-            nemesis.rank or 1, nemesis.rankTier or "Marked"), 1, 0.82, 0)
-
-        if nemesis.affixText and nemesis.affixText ~= "None" then
-            GameTooltip:AddLine("Affixes: " .. nemesis.affixText, 1.0, 0.6, 0.2)
-        end
-
-        local tr, tg, tb = threatColor(nemesis.threatClass)
-        GameTooltip:AddLine("Threat: " .. (nemesis.threatClass or "low"), tr, tg, tb)
-
-        if nemesis.targetName and nemesis.targetName ~= "" then
-            GameTooltip:AddLine("Hunts: " .. nemesis.targetName, 1.0, 0.3, 0.3)
-        end
-
-        GameTooltip:AddLine("Reward: " .. (nemesis.rewardClass or "none"), 0.8, 0.8, 0.2)
-        GameTooltip:Show()
-    end
-
     GameTooltip:HookScript("OnTooltipSetUnit", function(self)
         local _, unit = self:GetUnit()
         if not unit or not UnitExists(unit) then
             return
         end
-        local nemesis = findNemesisByUnitLoose(unit)
+        local nemesis = findNemesisByUnit(unit)
         if nemesis then
             local title = nemesis.nemesisTitle or ""
             if title ~= "" then
-                GameTooltipTextLeft1:SetText(title)
+                GameTooltipTextLeft1:SetText("|cffff4444" .. title .. "|r")
+            end
+            local baseName = nemesis.localizedName or nemesis.name or ""
+            if baseName ~= "" and baseName ~= title then
+                GameTooltip:AddLine(baseName, 0.75, 0.75, 0.75)
             end
             GameTooltip:AddLine(" ")
-            GameTooltip:AddLine(string.format("Rank %d - %s",
-                nemesis.rank or 1, nemesis.rankTier or "Marked"), 1, 0.82, 0)
-            if nemesis.affixText and nemesis.affixText ~= "None" then
-                GameTooltip:AddLine("Affixes: " .. nemesis.affixText, 1.0, 0.6, 0.2)
-            end
-            local tr, tg, tb = threatColor(nemesis.threatClass)
-            GameTooltip:AddLine("Threat: " .. (nemesis.threatClass or "low"), tr, tg, tb)
-            if nemesis.targetName and nemesis.targetName ~= "" then
-                GameTooltip:AddLine("Hunts: " .. nemesis.targetName, 1.0, 0.3, 0.3)
-            end
-            GameTooltip:AddLine("Reward: " .. (nemesis.rewardClass or "none"), 0.8, 0.8, 0.2)
+            WM.RenderTooltipBlock(GameTooltip, nemesis)
             GameTooltip:Show()
         end
     end)
@@ -844,23 +878,11 @@ local function createPortraitIcon(parentFrame, anchorFrame)
         local nemesis = self.nemesis
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         local portTitle = nemesis.nemesisTitle or ""
-        if portTitle ~= "" then
-            GameTooltip:SetText(string.format("|cffff4444%s", portTitle))
-            GameTooltip:AddLine(string.format("Rank %d - %s",
-                nemesis.rank or 1, nemesis.rankTier or "Marked"), 1, 1, 1)
-        else
-            GameTooltip:SetText(string.format("|cffff4444Rank %d - %s",
-                nemesis.rank or 1, nemesis.rankTier or "Marked"))
+        if portTitle == "" then
+            portTitle = nemesis.name or "Немезида"
         end
-        if nemesis.affixText and nemesis.affixText ~= "None" then
-            GameTooltip:AddLine("Affixes: " .. nemesis.affixText, 1.0, 0.6, 0.2)
-        end
-        local tr, tg, tb = threatColor(nemesis.threatClass)
-        GameTooltip:AddLine("Threat: " .. (nemesis.threatClass or "low"), tr, tg, tb)
-        if nemesis.targetName and nemesis.targetName ~= "" then
-            GameTooltip:AddLine("Hunts: " .. nemesis.targetName, 1.0, 0.3, 0.3)
-        end
-        GameTooltip:AddLine("Reward: " .. (nemesis.rewardClass or "none"), 0.8, 0.8, 0.2)
+        GameTooltip:SetText(string.format("|cffff4444%s", portTitle))
+        WM.RenderTooltipBlock(GameTooltip, nemesis)
         GameTooltip:Show()
     end)
     frame:SetScript("OnLeave", function()
@@ -874,31 +896,7 @@ end
 local targetIcon = nil
 local focusIcon = nil
 
-local function getCreatureEntryFromGuid(guid)
-    if not guid then
-        return nil
-    end
-    -- WoW 3.3.5 GUID: 64-bit = High(16) | Entry(24) | Counter(24)
-    -- UnitGUID returns "0xHHHHEEEEEECCCCCC" (18 hex digits)
-    -- Entry is hex chars 5-10 (1-indexed in the hex part after 0x)
-    local guidHex = string.match(guid, "0x(%x+)")
-    if not guidHex or string.len(guidHex) < 12 then
-        return nil
-    end
-    -- Verify it's a creature (high = F130, F140, F150)
-    local high = string.sub(guidHex, 1, 4)
-    if high ~= "F130" and high ~= "F140" and high ~= "F150" then
-        return nil
-    end
-    local entryHex = string.sub(guidHex, 5, 10)
-    local entry = tonumber(entryHex, 16)
-    if entry and entry > 0 then
-        return entry
-    end
-    return nil
-end
-
-local function findNemesisByUnit(unit)
+findNemesisByUnit = function(unit)
     if not unit or not UnitExists(unit) then
         return nil
     end
@@ -920,42 +918,6 @@ local function findNemesisByUnit(unit)
         for _, nemesis in pairs(NT.data.nemeses) do
             if nemesis.nemesisTitle and nemesis.nemesisTitle ~= "" and nemesis.nemesisTitle == unitName then
                 return nemesis
-            end
-        end
-    end
-
-    return nil
-end
-
--- Looser matching for tooltips — includes entry+zone fallback
-local function findNemesisByUnitLoose(unit)
-    -- Try exact match first
-    local nemesis = findNemesisByUnit(unit)
-    if nemesis then
-        return nemesis
-    end
-
-    -- Fallback: entry + zone
-    local guid = UnitGUID(unit)
-    if not guid then
-        return nil
-    end
-
-    local entry = getCreatureEntryFromGuid(guid)
-    if not entry then
-        return nil
-    end
-
-    local playerFile = getPlayerZoneFile()
-    if not playerFile then
-        return nil
-    end
-
-    for _, nem in pairs(NT.data.nemeses) do
-        if nem.creatureEntry == entry then
-            local nemFile = getNemesisMapFile(nem)
-            if nemFile and nemFile == playerFile then
-                return nem
             end
         end
     end
