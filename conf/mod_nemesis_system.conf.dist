@@ -122,7 +122,7 @@ NemesisSystem.MaxPerZone = 20
 #        Default:     300
 #
 
-NemesisSystem.RankUpCooldownSeconds = 300
+NemesisSystem.RankUpCooldownSeconds = 900
 
 #
 #    NemesisSystem.SameVictimCooldownSeconds
@@ -131,7 +131,7 @@ NemesisSystem.RankUpCooldownSeconds = 300
 #        Default:     900
 #
 
-NemesisSystem.SameVictimCooldownSeconds = 900
+NemesisSystem.SameVictimCooldownSeconds = 2700
 
 #
 #    NemesisSystem.PromotionLevelDiffMax
@@ -393,3 +393,201 @@ NemesisSystem.BountyVendor.Enable = 1
 #
 
 NemesisSystem.BountyVendor.Entry = 190000
+
+###############################################################################
+# BOUNTY BOARD SETTINGS
+#
+#    Per-player daily rotating list of nemesis contracts offered at innkeepers.
+#    Accept one, kill the target within the duration, get bonus tokens.
+#    Only one active contract per player at a time. No refund on 24h expiry,
+#    but if an admin clears the target nemesis the player gets a consolation
+#    mail.
+###############################################################################
+
+#
+#    NemesisSystem.BountyBoard.Enable
+#        Description: Master toggle for the bounty board gossip and logic.
+#        Default:     1 - Enabled
+#                     0 - Disabled
+#
+
+NemesisSystem.BountyBoard.Enable = 1
+
+#
+#    NemesisSystem.BountyBoard.SlotsPerDay
+#        Description: Number of bounties offered to the player per daily
+#                     rotation. If fewer eligible nemeses exist, the board
+#                     will show fewer entries.
+#        Default:     3
+#
+
+NemesisSystem.BountyBoard.SlotsPerDay = 3
+
+#
+#    NemesisSystem.BountyBoard.DurationHours
+#        Description: How many hours an accepted bounty stays active before
+#                     expiring. Uncompleted expiries give no refund.
+#        Default:     24
+#
+
+NemesisSystem.BountyBoard.DurationHours = 24
+
+#
+#    NemesisSystem.BountyBoard.PoolRefreshHours
+#        Description: How often the per-player per-zone bounty pool rotates.
+#                     Within this window, talking to any innkeeper in the same
+#                     zone shows the same bounties; completed bounties are
+#                     hidden until the next rotation so they're not re-offered.
+#                     Short enough that a cleared zone can refresh; long enough
+#                     that players can't trivially re-roll by reopening gossip.
+#        Default:     2
+#
+
+NemesisSystem.BountyBoard.PoolRefreshHours = 2
+
+#
+#    NemesisSystem.BountyBoard.LevelRangeDown
+#        Description: Maximum levels below the player a nemesis may be to
+#                     qualify. 0 = no limit (a high-level player may accept
+#                     contracts on low-level nemeses). Independent of the
+#                     regular nemesis-kill gray-level gating — the bounty
+#                     contract reward is always granted on completion.
+#        Default:     0 - No lower-level limit
+#
+
+NemesisSystem.BountyBoard.LevelRangeDown = 0
+
+#
+#    NemesisSystem.BountyBoard.LevelRangeUp
+#        Description: Maximum levels above the player a nemesis may be to
+#                     qualify. 0 = no limit.
+#        Default:     0 - No upper-level limit
+#
+
+NemesisSystem.BountyBoard.LevelRangeUp = 0
+
+#
+#    NemesisSystem.BountyBoard.RewardTokens
+#        Description: Base token reward for completing a bounty.
+#        Default:     3
+#
+
+NemesisSystem.BountyBoard.RewardTokens = 3
+
+#
+#    NemesisSystem.BountyBoard.RewardTokensPerRank
+#        Description: Additional tokens per nemesis rank. Total reward is
+#                     RewardTokens + (RewardTokensPerRank * rank).
+#        Default:     2
+#
+
+NemesisSystem.BountyBoard.RewardTokensPerRank = 2
+
+#
+#    NemesisSystem.BountyBoard.RewardGold
+#        Description: Base gold reward (copper) for completing a bounty.
+#        Default:     5000 (50 silver)
+#
+
+NemesisSystem.BountyBoard.RewardGold = 5000
+
+#
+#    NemesisSystem.BountyBoard.RewardGoldPerRank
+#        Description: Additional gold (copper) per nemesis rank.
+#        Default:     5000
+#
+
+NemesisSystem.BountyBoard.RewardGoldPerRank = 5000
+
+#
+#    NemesisSystem.BountyBoard.AnnounceAccept
+#        Description: Broadcast a red server-wide message when a contract
+#                     is accepted.
+#        Default:     1 - Enabled
+#
+
+NemesisSystem.BountyBoard.AnnounceAccept = 1
+
+#
+#    NemesisSystem.BountyBoard.AnnounceCompletion
+#        Description: Broadcast a red server-wide message when a contract
+#                     is completed.
+#        Default:     1 - Enabled
+#
+
+NemesisSystem.BountyBoard.AnnounceCompletion = 1
+
+#
+#    NemesisSystem.BountyBoard.RefundTokensOnAdminClear
+#        Description: If the target nemesis is cleared by an admin/server
+#                     command, mail the player this many consolation tokens
+#                     and cancel the contract. Set to 0 to disable refunds.
+#        Default:     1
+#
+
+NemesisSystem.BountyBoard.RefundTokensOnAdminClear = 1
+
+###############################################################################
+# Hunter's Covenant Reputation
+#
+# Server-only rank system awarded on eligible nemesis kills and bounty
+# completions. 5 ranks: Послушник / Охотник / Следопыт / Ветеран Охоты /
+# Легенда Охоты. Each rank grants a custom CharTitle (DBC IDs 200-204).
+###############################################################################
+
+#
+#    NemesisRep.Enable
+#        Description: Master switch for the reputation system.
+#        Default:     1
+#
+
+NemesisRep.Enable = 1
+
+#
+#    NemesisRep.BasePerKill
+#        Description: Flat reputation per eligible nemesis kill (gray-gated:
+#                     gray-level kills grant 0). Combined with PerRankBonus.
+#        Default:     50
+#
+
+NemesisRep.BasePerKill = 50
+
+#
+#    NemesisRep.PerRankBonus
+#        Description: Additional rep per kill scaled by the nemesis rank
+#                     (1-6). Total per kill = Base + PerRankBonus * rank.
+#        Default:     10
+#
+
+NemesisRep.PerRankBonus = 10
+
+#
+#    NemesisRep.BountyCompletionBonus
+#        Description: Flat bonus rep on completing a bounty contract.
+#                     NOT gray-gated — the board only offers level-appropriate
+#                     targets so exploit risk is nil.
+#        Default:     200
+#
+
+NemesisRep.BountyCompletionBonus = 200
+
+#
+#    NemesisRep.BountyCompletionPerRank
+#        Description: Per-rank addition to the bounty completion bonus.
+#                     Total = BountyCompletionBonus + PerRank * bountyRank.
+#        Default:     50
+#
+
+NemesisRep.BountyCompletionPerRank = 50
+
+#
+#    NemesisRep.Threshold.Rank2..Rank5
+#        Description: Rep points required to promote into each tier.
+#                     Rank 1 (Послушник) starts at 0 and has no threshold.
+#        Defaults:    500 / 2500 / 8000 / 20000
+#
+
+NemesisRep.Threshold.Rank2 = 500
+NemesisRep.Threshold.Rank3 = 2500
+NemesisRep.Threshold.Rank4 = 8000
+NemesisRep.Threshold.Rank5 = 20000

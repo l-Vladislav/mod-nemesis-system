@@ -10,3 +10,4 @@ MapData.lua
 Core.lua
 UI.lua
 WorldMap.lua
+BountyBoard.lua

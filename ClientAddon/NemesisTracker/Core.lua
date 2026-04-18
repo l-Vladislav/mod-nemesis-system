@@ -561,6 +561,9 @@ function NT:UpsertNemesisFromFields(fields, startIndex, source)
         runtimeGuid = fields[startIndex + 22] or "",
         nemesisTitle = fields[startIndex + 23] or "",
         localizedName = fields[startIndex + 24] or "",
+        repPoints = tonumber(fields[startIndex + 25]) or 0,
+        repRank = tonumber(fields[startIndex + 26]) or 1,
+        expiresAt = tonumber(fields[startIndex + 27]) or 0,
         lastSeenSource = source,
         isAlive = true,
         removeReason = nil,
@@ -793,6 +796,25 @@ function NT:ParseServerPayload(payload)
     end
     if opcode == "REMOVE" then
         self:RemoveNemesis(tonumber(fields[3]), fields[4])
+        return
+    end
+    if opcode == "HIST_BEGIN" then
+        if self.BountyBoard and self.BountyBoard.BeginHistory then
+            self.BountyBoard:BeginHistory()
+        end
+        return
+    end
+    if opcode == "HIST_ENTRY" then
+        if self.BountyBoard and self.BountyBoard.AddHistoryEntry then
+            self.BountyBoard:AddHistoryEntry(fields)
+        end
+        return
+    end
+    if opcode == "HIST_END" then
+        if self.BountyBoard and self.BountyBoard.FinalizeHistory then
+            self.BountyBoard:FinalizeHistory()
+        end
+        return
     end
 end
 
@@ -1139,8 +1161,82 @@ function NT:UPDATE_MOUSEOVER_UNIT()
     self:TrackKnownUnit("mouseover")
 end
 
+-- Bounty contract tracking ---------------------------------------------------
+-- The server doesn't push bounty state via addon messages; instead we listen
+-- to the server chat announcements and parse them. Persisted in SavedVariables
+-- so the highlight survives /reload and re-login.
+
+function NT:GetActiveBountyTitle()
+    return self.db and self.db.activeBountyTitle or nil
+end
+
+function NT:SetActiveBountyTitle(title)
+    if not self.db then return end
+    self.db.activeBountyTitle = title
+    if self.WorldMap then
+        self.WorldMap:RefreshWorldMap()
+        self.WorldMap:RefreshPortraitIcons()
+    end
+    if self.UI then
+        self.UI:RefreshAll()
+    end
+end
+
+function NT:IsActiveBounty(nemesis)
+    if not nemesis then return false end
+    local active = self:GetActiveBountyTitle()
+    if not active or active == "" then return false end
+    return nemesis.nemesisTitle and nemesis.nemesisTitle == active
+end
+
+-- Extracts "{title}" after an anchor phrase, stopping at the next " (" or end.
+local function extractTitleAfter(message, anchor)
+    local startIdx = string.find(message, anchor, 1, true)
+    if not startIdx then return nil end
+    local titleStart = startIdx + string.len(anchor)
+    local tail = string.sub(message, titleStart)
+    -- Strip a trailing "(…)" clause (e.g. "(награда 15 жет.)") and trailing punct.
+    tail = string.gsub(tail, "%s*%(.-%)%s*$", "")
+    tail = string.gsub(tail, "[%s%.!]+$", "")
+    if tail == "" then return nil end
+    return tail
+end
+
+function NT:ParseBountyChat(message)
+    if not message then return end
+    -- Accept: "[Немезида]: Контракт принят: {title} (награда X жет.)"
+    local acceptedTitle = extractTitleAfter(message, "Контракт принят: ")
+    if acceptedTitle then
+        self:SetActiveBountyTitle(acceptedTitle)
+        return
+    end
+    -- Complete: "[Немезида]: Контракт выполнен: {title}"
+    local completedTitle = extractTitleAfter(message, "Контракт выполнен: ")
+    if completedTitle then
+        self:SetActiveBountyTitle(nil)
+        return
+    end
+    -- Abandon: "[Немезида]: Контракт отменён." — no title payload
+    if string.find(message, "Контракт отмен", 1, true) then
+        self:SetActiveBountyTitle(nil)
+        return
+    end
+    -- Expiry (phase 3): "[Немезида]: Контракт на {title} истёк."
+    if string.find(message, "истёк", 1, true)
+        or string.find(message, "истек", 1, true) then
+        self:SetActiveBountyTitle(nil)
+        return
+    end
+end
+
 function NT:CHAT_MSG_SYSTEM(_, message)
     self:HandleSystemMessage(message)
+
+    -- Parse bounty contract events.
+    if message and string.find(message, "Немезида", 1, true)
+        and string.find(message, "Контракт", 1, true) then
+        self:ParseBountyChat(message)
+    end
 
     -- Trigger sync when a nemesis announcement appears in chat
     if message and (string.find(message, "[Nemesis]", 1, true) or string.find(message, "Немезида", 1, true)) then

@@ -143,9 +143,12 @@ function WM.RenderTooltipBlock(tooltip, nemesis, opts)
     tooltip:AddLine("Угроза: " .. (THREAT_RU[nemesis.threatClass]
         or nemesis.threatClass or ""), tr, tg, tb)
 
-    if opts.showReward ~= false then
-        tooltip:AddLine("Награда: " .. (REWARD_RU[nemesis.rewardClass]
-            or nemesis.rewardClass or ""), 0.9, 0.85, 0.3)
+    -- Reward line is only surfaced for the player's active bounty target.
+    -- The server-side rewardClass ("bounty"/"revenge"/"shared"/"none") is
+    -- computed per-nemesis, but the tooltip shouldn't claim every nemesis is
+    -- a bounty — that's reserved for the one the player has actually accepted.
+    if opts.showReward ~= false and NT:IsActiveBounty(nemesis) then
+        tooltip:AddLine("Награда: " .. REWARD_RU.bounty, 1.0, 0.82, 0.0)
     end
 end
 
@@ -337,18 +340,31 @@ local function createWorldPin(index)
     pin.hitArea:SetTexture(0, 0, 0, 0)
     pin:SetHitRectInsets(-4, -4, -4, -4)
 
-    -- Selection glow ring (behind icon)
+    -- Selection glow ring (behind icon). ADD blend so the dark pixels of
+    -- UI-Minimap-Background become transparent and only the tint shows —
+    -- no more black halo around the pin.
     pin.glow = pin:CreateTexture(nil, "BORDER")
     pin.glow:SetPoint("CENTER", pin, "CENTER", 0, 0)
     pin.glow:SetWidth(PIN_SIZE + 10)
     pin.glow:SetHeight(PIN_SIZE + 10)
     pin.glow:SetTexture("Interface\\Minimap\\UI-Minimap-Background")
+    pin.glow:SetBlendMode("ADD")
     pin.glow:SetVertexColor(1.0, 1.0, 0.0, 0.7)
     pin.glow:Hide()
 
     pin.icon = pin:CreateTexture(nil, "ARTWORK")
     pin.icon:SetAllPoints(pin)
     pin.icon:SetTexture("Interface\\TargetingFrame\\UI-RaidTargetingIcon_8")
+
+    -- "Wanted" quest-mark overlay: yellow exclamation, centered over
+    -- the top-right corner of the skull (half inside, half outside —
+    -- standard badge style), shown only for the player's active bounty.
+    pin.questMark = pin:CreateTexture(nil, "OVERLAY")
+    pin.questMark:SetPoint("CENTER", pin, "TOPRIGHT", 0, -2)
+    pin.questMark:SetWidth(16)
+    pin.questMark:SetHeight(16)
+    pin.questMark:SetTexture("Interface\\GossipFrame\\AvailableQuestIcon")
+    pin.questMark:Hide()
 
     pin:EnableMouse(true)
     pin:RegisterForClicks("LeftButtonUp")
@@ -672,6 +688,10 @@ function WM:RefreshListPanel()
                 currentMark = "|cff00ff00*|r "
             end
 
+            -- Active bounty target: gold exclamation prefix + bold name.
+            local isActiveBounty = NT:IsActiveBounty(nemesis)
+            local bountyMark = isActiveBounty and "|cffffd100!|r " or ""
+
             -- Format coordinates from mapX/mapY (0-1) to percentage display
             local coordText = ""
             local mx = nemesis.mapX or 0
@@ -684,23 +704,32 @@ function WM:RefreshListPanel()
             if displayName == "" then
                 displayName = nemesis.name or "Unknown"
             end
+            if isActiveBounty then
+                displayName = "|cffffd100" .. displayName .. "|r"
+            end
 
-            row.text:SetText(string.format("%s|cff%02x%02x%02xR%d|r %s%s",
+            row.text:SetText(string.format("%s%s|cff%02x%02x%02xR%d|r %s%s",
+                bountyMark,
                 currentMark,
                 math.floor(r * 255), math.floor(g * 255), math.floor(b * 255),
                 nemesis.rank or 1,
                 displayName,
                 coordText))
 
-            local alpha = NT:GetVisibilityAlpha(nemesis)
+            -- Active bounty stays fully opaque; staleness alpha ignored.
+            local alpha = isActiveBounty and 1.0 or NT:GetVisibilityAlpha(nemesis)
             row:SetAlpha(alpha)
 
-            -- Highlight selected nemesis in list
-            local selectedId = NT.data.selectedSpawnId
-            if selectedId and nemesis.spawnId == selectedId then
-                row.bg:SetTexture(0.25, 0.25, 0.35, 0.7)
+            -- Row background: active bounty wins, then selection, then default.
+            if isActiveBounty then
+                row.bg:SetTexture(0.35, 0.30, 0.05, 0.6)  -- muted gold
             else
-                row.bg:SetTexture(0, 0, 0, 0)
+                local selectedId = NT.data.selectedSpawnId
+                if selectedId and nemesis.spawnId == selectedId then
+                    row.bg:SetTexture(0.25, 0.25, 0.35, 0.7)
+                else
+                    row.bg:SetTexture(0, 0, 0, 0)
+                end
             end
 
             row:Show()
@@ -757,6 +786,9 @@ function WM:RefreshWorldMap()
         pin.nemesis = nemesis
 
         local isSelected = nemesis.spawnId == selectedId
+        local isActiveBounty = NT:IsActiveBounty(nemesis)
+
+        -- Size: active bounty stays normal; only user-selected pin grows.
         local size = isSelected and SELECTED_PIN_SIZE or PIN_SIZE
         pin:SetWidth(size)
         pin:SetHeight(size)
@@ -772,15 +804,30 @@ function WM:RefreshWorldMap()
             local r, g, b = rankColor(nemesis.rank or 1)
             pin.icon:SetVertexColor(r, g, b)
 
-            local alpha = NT:GetVisibilityAlpha(nemesis)
+            -- Active bounty overrides staleness — always fully opaque.
+            local alpha = isActiveBounty and 1.0 or NT:GetVisibilityAlpha(nemesis)
             pin:SetAlpha(alpha)
 
-            if isSelected then
+            -- Glow: gold for active bounty (wins over selection), yellow for selection.
+            if isActiveBounty then
+                pin.glow:SetVertexColor(1.0, 0.78, 0.0, 1.0)  -- gold
+                pin.glow:SetWidth(size + 12)
+                pin.glow:SetHeight(size + 12)
+                pin.glow:Show()
+            elseif isSelected then
+                pin.glow:SetVertexColor(1.0, 1.0, 0.0, 0.7)   -- yellow
                 pin.glow:SetWidth(size + 8)
                 pin.glow:SetHeight(size + 8)
                 pin.glow:Show()
             else
                 pin.glow:Hide()
+            end
+
+            -- Quest-mark "!" overlay only on the active bounty target.
+            if isActiveBounty then
+                pin.questMark:Show()
+            else
+                pin.questMark:Hide()
             end
 
             pin:Show()
@@ -857,18 +904,30 @@ local function createPortraitIcon(parentFrame, anchorFrame)
     frame:SetFrameLevel(10)
     frame:SetPoint("CENTER", anchorFrame, "TOP", 0, 0)
 
-    -- Colored glow behind the skull
+    -- Colored glow behind the skull. ADD blend so the dark texture becomes
+    -- transparent — only the tinted highlight shows, no black halo.
     frame.glow = frame:CreateTexture(nil, "BACKGROUND")
     frame.glow:SetPoint("CENTER", frame, "CENTER", 0, 0)
     frame.glow:SetWidth(size + 8)
     frame.glow:SetHeight(size + 8)
     frame.glow:SetTexture("Interface\\Minimap\\UI-Minimap-Background")
+    frame.glow:SetBlendMode("ADD")
     frame.glow:SetVertexColor(1.0, 0.0, 0.0, 0.6)
 
     -- Skull icon
     frame.icon = frame:CreateTexture(nil, "ARTWORK")
     frame.icon:SetAllPoints(frame)
     frame.icon:SetTexture("Interface\\TargetingFrame\\UI-RaidTargetingIcon_8")
+
+    -- "Wanted" quest-marker overlay — shown only when this unit is the
+    -- player's active bounty target. Fully outside the skull, floating to
+    -- the right with a small gap.
+    frame.questMark = frame:CreateTexture(nil, "OVERLAY")
+    frame.questMark:SetPoint("LEFT", frame, "RIGHT", -8, 6)
+    frame.questMark:SetWidth(16)
+    frame.questMark:SetHeight(16)
+    frame.questMark:SetTexture("Interface\\GossipFrame\\AvailableQuestIcon")
+    frame.questMark:Hide()
 
     frame:EnableMouse(true)
     frame:SetScript("OnEnter", function(self)
@@ -946,7 +1005,16 @@ local function updatePortraitIcon(icon, unit)
 
     local r, g, b = rankColor(nemesis.rank or 1)
     icon.icon:SetVertexColor(r, g, b)
-    icon.glow:SetVertexColor(r * 0.5, g * 0.3, b * 0.3, 0.6)
+
+    local isActiveBounty = NT:IsActiveBounty(nemesis)
+    if isActiveBounty then
+        -- Gold glow for the player's active bounty target.
+        icon.glow:SetVertexColor(1.0, 0.78, 0.0, 0.9)
+        icon.questMark:Show()
+    else
+        icon.glow:SetVertexColor(r * 0.5, g * 0.3, b * 0.3, 0.6)
+        icon.questMark:Hide()
+    end
 
     local size = 22 + (nemesis.rank or 1)
     icon:SetWidth(size)
@@ -1066,8 +1134,7 @@ function WM:CreateMinimapButton()
 
     button:SetScript("OnClick", function(self, clickType)
         if clickType == "RightButton" then
-            NT:RefreshFromSources()
-        else
+            -- Right-click: toggle world map (moved from left-click).
             if WorldMapFrame and WorldMapFrame:IsShown() then
                 HideUIPanel(WorldMapFrame)
             else
@@ -1076,15 +1143,20 @@ function WM:CreateMinimapButton()
                 end
                 ShowUIPanel(WorldMapFrame)
             end
+        else
+            -- Left-click: open the BountyBoard journal.
+            if NT.BountyBoard and NT.BountyBoard.Toggle then
+                NT.BountyBoard:Toggle()
+            end
         end
     end)
 
     button:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_LEFT")
         GameTooltip:SetText("|cffff4444Немезида|r")
-        GameTooltip:AddLine("Left-click: Toggle world map", 1, 1, 1)
-        GameTooltip:AddLine("Right-click: Force sync", 1, 1, 1)
-        GameTooltip:AddLine("Drag: Move button", 0.7, 0.7, 0.7)
+        GameTooltip:AddLine("ЛКМ: открыть журнал охотника", 1, 1, 1)
+        GameTooltip:AddLine("ПКМ: открыть карту мира", 1, 1, 1)
+        GameTooltip:AddLine("Перетащите для перемещения", 0.7, 0.7, 0.7)
         GameTooltip:Show()
     end)
 
