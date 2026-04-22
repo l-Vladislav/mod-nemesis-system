@@ -21,12 +21,14 @@ local RANK_NAMES = {
 
 local RANK_THRESHOLDS = { 0, 500, 2500, 8000, 20000 }
 
+-- Tier colors mirror Blizz FACTION_BAR_COLORS so the rep bar reads as a
+-- native rep bar (Neutral → Friendly → Honored → Revered → Exalted).
 local function rankColorByTier(rank)
-    if rank >= 5 then return 1.0, 0.82, 0.0  end -- gold
-    if rank >= 4 then return 1.0, 0.45, 0.1  end -- orange
-    if rank >= 3 then return 0.7, 0.5, 1.0   end -- purple
-    if rank >= 2 then return 0.2, 0.9, 0.4   end -- green
-    return 0.7, 0.7, 0.7                         -- grey
+    if rank >= 5 then return 0.00, 0.60, 0.10 end -- exalted deep green
+    if rank >= 4 then return 0.00, 0.39, 0.00 end -- revered
+    if rank >= 3 then return 0.00, 0.25, 0.59 end -- honored-blue
+    if rank >= 2 then return 0.20, 0.60, 0.20 end -- friendly
+    return 0.60, 0.60, 0.60                       -- neutral grey
 end
 
 local AFFIX_RU = {
@@ -82,6 +84,16 @@ local function formatExpiryCountdown(expiresAt, now)
     return string.format("%dм", minutes)
 end
 
+-- Strips the Blizz title template's "%s" placeholder + surrounding
+-- whitespace so we show just "Охотник" rather than "Охотник %s". Defined
+-- early because Create() references it before BuildTitleMenu's file slot.
+local function cleanTitleName(name)
+    if not name then return "" end
+    name = name:gsub("%%s", "")
+    name = name:gsub("^%s+", ""):gsub("%s+$", "")
+    return name
+end
+
 local function formatTimestamp(ts)
     if not ts or ts <= 0 then
         return "—"
@@ -98,24 +110,107 @@ end
 -- Backdrop helper (matches NT.UI style)
 ----------------------------------------------------------------
 
-local function setDialogBackdrop(frame, alpha)
-    frame:SetBackdrop({
-        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-        tile = true, tileSize = 16, edgeSize = 12,
-        insets = { left = 3, right = 3, top = 3, bottom = 3 },
-    })
-    frame:SetBackdropColor(0, 0, 0, alpha or 0.9)
+-- Book body backdrop: Blizzard spellbook parchment. Rendered as 4 quadrant
+-- child textures (UI-SpellbookPanel-*) — that's how the real spellbook
+-- composes its torn-parchment page. Ornate gold border stays via SetBackdrop.
+local SPELLBOOK_QUADS = {
+    "TopLeft", "TopRight", "BotLeft", "BotRight",
+}
+
+local function layoutQuads(quads, frame, inset)
+    inset = inset or 3
+    quads[1]:SetPoint("TOPLEFT",     frame, "TOPLEFT",     inset, -inset)
+    quads[1]:SetPoint("BOTTOMRIGHT", frame, "CENTER",      0, 0)
+    quads[2]:SetPoint("TOPLEFT",     frame, "TOP",         0, -inset)
+    quads[2]:SetPoint("BOTTOMRIGHT", frame, "RIGHT",      -inset, 0)
+    quads[3]:SetPoint("TOPLEFT",     frame, "LEFT",        inset, 0)
+    quads[3]:SetPoint("BOTTOMRIGHT", frame, "BOTTOM",      0, inset)
+    quads[4]:SetPoint("TOPLEFT",     frame, "CENTER",      0, 0)
+    quads[4]:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -inset, inset)
 end
 
-local function setParchmentBackdrop(frame)
-    frame:SetBackdrop({
-        bgFile = "Interface\\QuestFrame\\QuestBG",  -- parchment look
-        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-        tile = true, tileSize = 64, edgeSize = 10,
-        insets = { left = 3, right = 3, top = 3, bottom = 3 },
-    })
-    frame:SetBackdropColor(1, 1, 1, 0.35)
+local function addSpellbookParchment(frame, inset)
+    local quads = {}
+    for i, pos in ipairs(SPELLBOOK_QUADS) do
+        local tex = frame:CreateTexture(nil, "BACKGROUND")
+        tex:SetTexture("Interface\\Spellbook\\UI-SpellbookPanel-" .. pos)
+        quads[i] = tex
+    end
+    layoutQuads(quads, frame, inset or 4)
+    frame._parchment = quads
+    return quads
+end
+
+-- Outer frame still uses the spellbook parchment fill for now, but all
+-- the sub-panels are borderless — they're just invisible layout regions
+-- sitting directly on the FriendsFrame chrome body.
+local function setBookBackdrop(frame)
+    frame:SetBackdrop(nil)
+end
+
+local function setPageBackdrop(frame)
+    frame:SetBackdrop(nil)
+end
+
+local function setListBackdrop(frame)
+    frame:SetBackdrop(nil)
+end
+
+----------------------------------------------------------------
+-- Classic loading-screen artwork lookup
+-- Stock 3.3.5a textures at `Interface\Glues\LoadingScreens\`.
+-- Zones route to their continent's cinematic panel; the few cities with
+-- dedicated loading screens in 3.3.5a get their own override.
+----------------------------------------------------------------
+
+local LOADSCREEN_DIR = "Interface\\LoadingScreens\\"
+
+-- Per-zone dedicated loading screens. Keys are GetMapInfo() file names.
+-- Only zones confirmed to ship with a dedicated LoadScreen_* BLP in 3.3.5a.
+local CITY_LOADSCREEN = {
+    StormwindCity    = "LoadScreenStormwindCity",
+    OrgrimmarCity    = "LoadScreenOrgrimmarCity",
+    IronforgeCity    = "LoadScreenIronforgeCity",
+    UndercityCity    = "LoadScreenUndercityCity",
+    Darnassus        = "LoadScreenDarnassusCity",
+    ThunderbluffCity = "LoadScreenThunderBluffCity",
+    ShattrathCity    = "LoadScreenShattrathCity",
+    DalaranCity      = "LoadScreenDalaran",
+}
+
+-- Northrend zones (continent LoadScreenNorthrend).
+local NORTHREND_ZONES = {
+    BoreanTundra=1, HowlingFjord=1, Dragonblight=1, GrizzlyHills=1,
+    ZulDrak=1, SholazarBasin=1, StormPeaks=1, TheStormPeaks=1,
+    Icecrown=1, IceCrown=1, CrystalsongForest=1, DalaranCity=1,
+    Wintergrasp=1,
+}
+
+-- Outland zones (continent LoadScreenOutland).
+local OUTLAND_ZONES = {
+    HellfirePeninsula=1, Zangarmarsh=1, Nagrand=1,
+    TerokkarForest=1, Terokkar=1, ShadowmoonValley=1,
+    BladesEdgeMountains=1, BladesEdge=1, Netherstorm=1,
+    ShattrathCity=1, IsleofQuelDanas=1, QuelDanas=1,
+}
+
+local function resolveZoneLoadScreen(mapFile)
+    if not mapFile or mapFile == "" then return nil end
+
+    local override = CITY_LOADSCREEN[mapFile]
+    if override then
+        return LOADSCREEN_DIR .. override
+    end
+
+    if NORTHREND_ZONES[mapFile] then
+        return LOADSCREEN_DIR .. "LoadScreenNorthrend"
+    end
+    if OUTLAND_ZONES[mapFile] then
+        return LOADSCREEN_DIR .. "LoadScreenOutland"
+    end
+
+    -- Default: Eastern Kingdoms / Kalimdor pre-Cata panel.
+    return LOADSCREEN_DIR .. "LoadScreenAzeroth"
 end
 
 ----------------------------------------------------------------
@@ -143,7 +238,7 @@ end
 
 function BB:FinalizeHistory()
     self.historyPending = false
-    if self.frame and self.frame:IsShown() and self.activeTab == 2 then
+    if self.frame and self.frame:IsShown() and self.activeTab == 3 then
         self:RenderHistoryTab()
     end
 end
@@ -159,11 +254,28 @@ end
 -- Frame construction
 ----------------------------------------------------------------
 
-local ROW_HEIGHT = 18
-local MAX_ZONE_ROWS = 10
-local MAX_HISTORY_ROWS = 14
-local FRAME_WIDTH = 400
-local FRAME_HEIGHT = 560
+local ROW_HEIGHT = 15
+local MAX_ZONE_ROWS = 7
+local MAX_HISTORY_ROWS = 40
+-- FriendsFrame chrome is 4×(256x256). At width 384 the top/bottom pairs
+-- overlap 128px horizontally (as designed). We shrink the height so the
+-- top and bottom halves overlap vertically — removes the empty vertical
+-- dead space below the content.
+local FRAME_WIDTH = 384
+local FRAME_HEIGHT = 512
+
+-- Layout constants — lifted from FriendsFrame.xml so content aligns to the
+-- chrome art's inset area. Frame is 384x512.
+-- Tabs: (30, -64) from TOPLEFT.
+-- Content: stock FriendsFrame uses (21, -100)→(-61, 105) = 302 wide.
+-- We shrink the inner content width by ~20% and center it so panels
+-- don't stretch edge-to-edge of the chrome.
+local TAB_X         = 30
+local TAB_Y         = -64
+local CONTENT_LEFT  = 25
+local CONTENT_TOP   = -100
+local CONTENT_RIGHT = -91
+local CONTENT_BOTTOM = 40
 
 function BB:Create()
     if self.frame then
@@ -175,49 +287,60 @@ function BB:Create()
     frame:SetHeight(FRAME_HEIGHT)
     frame:SetPoint("CENTER", UIParent, "CENTER", -220, 0)
     frame:SetFrameStrata("DIALOG")
+    frame:SetToplevel(true)           -- matches FriendsFrame's toplevel="true"
     frame:SetClampedToScreen(true)
     frame:SetMovable(true)
     frame:EnableMouse(true)
     frame:RegisterForDrag("LeftButton")
     frame:SetScript("OnDragStart", function(self) self:StartMoving() end)
     frame:SetScript("OnDragStop",  function(self) self:StopMovingOrSizing() end)
-    setDialogBackdrop(frame, 0.92)
     frame:Hide()
     self.frame = frame
 
-    -- Portrait (skull) in top-left
-    frame.portrait = frame:CreateTexture(nil, "ARTWORK")
-    frame.portrait:SetWidth(44)
-    frame.portrait:SetHeight(44)
-    frame.portrait:SetPoint("TOPLEFT", frame, "TOPLEFT", 8, -6)
-    frame.portrait:SetTexture("Interface\\TargetingFrame\\UI-RaidTargetingIcon_8")
-    frame.portrait:SetVertexColor(1.0, 0.3, 0.3)
+    -- FriendsFrame chrome: 4 quadrant textures compose the dark-metal frame.
+    -- Sizes come straight from FriendsFrame.xml — LEFT quads are 256 wide
+    -- (full half), RIGHT quads are only 128 wide. 256 + 128 = 384 = frame
+    -- width with zero overlap.
+    local function addFriendsChrome(f)
+        local base = "Interface\\FriendsFrame\\UI-FriendsFrame-"
+        local tl = f:CreateTexture(nil, "ARTWORK")
+        tl:SetTexture(base .. "TopLeft-bnet")
+        tl:SetWidth(256); tl:SetHeight(256)
+        tl:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
 
-    -- Title
-    local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    title:SetPoint("TOP", frame, "TOP", 0, -14)
-    title:SetText("Журнал Охотника")
-    title:SetTextColor(1.0, 0.82, 0.0)
+        local tr = f:CreateTexture(nil, "ARTWORK")
+        tr:SetTexture(base .. "TopRight-bnet")
+        tr:SetWidth(128); tr:SetHeight(256)  -- stock XML: 128x256
+        tr:SetPoint("TOPRIGHT", f, "TOPRIGHT", 0, 0)
 
-    -- Subtitle (RP tagline)
-    local subtitle = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    subtitle:SetPoint("TOP", title, "BOTTOM", 0, -2)
-    subtitle:SetText("|cffa0a0a0«Имена, начертанные кровью.»|r")
+        local bl = f:CreateTexture(nil, "ARTWORK")
+        bl:SetTexture(base .. "BotLeft-bnet")
+        bl:SetWidth(256); bl:SetHeight(256)
+        bl:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 0, 0)
 
-    -- Close button
+        local br = f:CreateTexture(nil, "ARTWORK")
+        br:SetTexture(base .. "BotRight-bnet")
+        br:SetWidth(128); br:SetHeight(256)  -- stock XML: 128x256
+        br:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", 0, 0)
+    end
+    addFriendsChrome(frame)
+
+    -- Close button — stock FriendsFrame offset (-30, -8) so it sits inside
+    -- the top-right recess baked into the chrome art.
     local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
-    close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -4, -4)
+    close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -30, -8)
+    frame.close = close
 
-    -- Refresh icon (force-sync)
+    -- Refresh (force-sync) — sits to the left of the close button.
     local refresh = CreateFrame("Button", nil, frame)
     refresh:SetWidth(22); refresh:SetHeight(22)
-    refresh:SetPoint("TOPRIGHT", close, "TOPLEFT", -2, 0)
+    refresh:SetPoint("TOPRIGHT", close, "TOPLEFT", -6, 0)
     refresh.icon = refresh:CreateTexture(nil, "ARTWORK")
     refresh.icon:SetAllPoints(refresh)
     refresh.icon:SetTexture("Interface\\Buttons\\UI-RefreshButton")
     refresh:SetScript("OnClick", function()
         if NT.RefreshFromSources then NT:RefreshFromSources() end
-        if BB.activeTab == 2 then BB:RequestHistory() end
+        if BB.activeTab == 3 then BB:RequestHistory() end
         BB:Refresh()
     end)
     refresh:SetScript("OnEnter", function(self)
@@ -228,36 +351,120 @@ function BB:Create()
     end)
     refresh:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-    -- Content frames (one per tab)
+    -- Brown spellbook icon on top of the FriendsFrame scroll icon (baked
+    -- into the TopLeft chrome). This stock texture already ships with its
+    -- own dark/leather surround, so no extra backdrop is needed.
+    local portrait = frame:CreateTexture(nil, "ARTWORK")
+    portrait:SetWidth(59); portrait:SetHeight(59)
+    portrait:SetPoint("CENTER", frame, "TOPLEFT", 38, -35)
+    portrait:SetTexture("Interface\\FriendsFrame\\FriendsFrameScrollIcon")
+    portrait:SetVertexColor(1, 1, 1)
+    frame.portrait = portrait
+
+    -- Title centered in the FriendsFrame header strip (matches stock y=-14).
+    local title = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    title:SetPoint("TOP", frame, "TOP", 0, -18)
+    title:SetText("Журнал Охотника")
+    title:SetTextColor(1.0, 0.82, 0.0)
+
+    -- Active-title picker — compact dropdown with a left-side label.
+    local titleLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    -- Title picker right-anchored with a touch of top padding so it sits
+    -- opposite the portrait and below the close-button row.
+    titleLabel:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -160, -52)
+    titleLabel:SetText("|cffffd100Титул:|r")
+    frame.titleLabel = titleLabel
+
+    local titleDD = CreateFrame("Frame", "NemesisBountyBoardTitleDropdown",
+        frame, "UIDropDownMenuTemplate")
+    titleDD:SetPoint("LEFT", titleLabel, "RIGHT", -8, 2)
+    UIDropDownMenu_SetWidth(titleDD, 96)
+    UIDropDownMenu_JustifyText(titleDD, "CENTER")
+    frame.titleDD = titleDD
+
+    UIDropDownMenu_Initialize(titleDD, BB.BuildTitleMenu)
+    UIDropDownMenu_SetText(titleDD, "«нет»")
+
+    -- Content area — matches FriendsFrame's scroll-frame inset exactly.
     frame.tabContent = {}
-    for i = 1, 2 do
+    for i = 1, 3 do
         local content = CreateFrame("Frame", nil, frame)
-        content:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -54)
-        content:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -12, 38)
+        content:SetPoint("TOPLEFT",     frame, "TOPLEFT",
+            CONTENT_LEFT, CONTENT_TOP)
+        content:SetPoint("TOPRIGHT",    frame, "TOPRIGHT",
+            CONTENT_RIGHT, CONTENT_TOP)
+        content:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT",
+            CONTENT_RIGHT, CONTENT_BOTTOM)
+        content:SetPoint("BOTTOMLEFT",  frame, "BOTTOMLEFT",
+            CONTENT_LEFT, CONTENT_BOTTOM)
         content:Hide()
         frame.tabContent[i] = content
     end
 
-    -- Tab buttons at bottom (Blizz CharacterFrame pattern)
+    -- ── Rep footer — persistent rank + progress bar across the frame bottom.
+    -- Rank text sits at the bottom-LEFT.
+    local repRankText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    repRankText:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 30, 86)
+    frame.repRankText = repRankText
+
+    -- Bar container + fill at the bottom-RIGHT (center-right of the footer).
+    local barFrame = CreateFrame("Frame", nil, frame)
+    barFrame:SetSize(170, 16)
+    barFrame:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -50, 82)
+    barFrame:SetBackdrop({
+        bgFile   = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        edgeSize = 10,
+        insets = { left = 3, right = 3, top = 3, bottom = 3 },
+    })
+    barFrame:SetBackdropColor(0.06, 0.04, 0.02, 0.85)
+    barFrame:SetBackdropBorderColor(0.55, 0.40, 0.22)
+
+    local repBar = CreateFrame("StatusBar", nil, barFrame)
+    repBar:SetPoint("TOPLEFT",     barFrame, "TOPLEFT",      3, -3)
+    repBar:SetPoint("BOTTOMRIGHT", barFrame, "BOTTOMRIGHT", -3,  3)
+    repBar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+    repBar:SetStatusBarColor(0.2, 0.6, 0.2)
+    repBar:SetMinMaxValues(0, 1)
+    repBar:SetValue(0)
+    frame.repBar = repBar
+
+    local repBarLabel = repBar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    repBarLabel:SetPoint("CENTER", repBar, "CENTER", 0, 0)
+    repBarLabel:SetTextColor(1, 1, 1)
+    frame.repBarLabel = repBarLabel
+
+    -- Sub-tabs — exact FriendsFrame offsets (30, -64 from TOPLEFT).
     local tabA = CreateFrame("Button", "NemesisBountyBoardTab1", frame,
-        "CharacterFrameTabButtonTemplate")
-    tabA:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 10, -30)
+        "TabButtonTemplate")
+    tabA:SetPoint("TOPLEFT", frame, "TOPLEFT", TAB_X, TAB_Y)
     tabA:SetText("Охота")
     tabA:SetID(1)
     tabA:SetScript("OnClick", function(self) BB:SelectTab(self:GetID()) end)
+    if PanelTemplates_TabResize then PanelTemplates_TabResize(tabA, 0) end
 
     local tabB = CreateFrame("Button", "NemesisBountyBoardTab2", frame,
-        "CharacterFrameTabButtonTemplate")
-    tabB:SetPoint("LEFT", tabA, "RIGHT", -14, 0)
-    tabB:SetText("Хроника")
+        "TabButtonTemplate")
+    tabB:SetPoint("LEFT", tabA, "RIGHT", 4, 0)
+    tabB:SetText("Немезиды")
     tabB:SetID(2)
     tabB:SetScript("OnClick", function(self) BB:SelectTab(self:GetID()) end)
+    if PanelTemplates_TabResize then PanelTemplates_TabResize(tabB, 0) end
 
-    frame.tabs = { tabA, tabB }
+    local tabC = CreateFrame("Button", "NemesisBountyBoardTab3", frame,
+        "TabButtonTemplate")
+    tabC:SetPoint("LEFT", tabB, "RIGHT", 4, 0)
+    tabC:SetText("Хроника")
+    tabC:SetID(3)
+    tabC:SetScript("OnClick", function(self) BB:SelectTab(self:GetID()) end)
+    if PanelTemplates_TabResize then PanelTemplates_TabResize(tabC, 0) end
 
-    -- Build per-tab content
+    frame.tabs = { tabA, tabB, tabC }
+
+    -- Build per-tab content (Hunt=1, Zone=2, History=3).
     self:BuildHuntTab(frame.tabContent[1])
-    self:BuildHistoryTab(frame.tabContent[2])
+    self:BuildZoneTab(frame.tabContent[2])
+    self:BuildHistoryTab(frame.tabContent[3])
 
     self:SelectTab(1)
     self:StartRefreshTimer()
@@ -284,7 +491,8 @@ function BB:SelectTab(index)
     for i, content in ipairs(self.frame.tabContent) do
         if i == index then content:Show() else content:Hide() end
     end
-    if index == 2 and not self.historyPending and #self.history == 0 then
+    -- History tab (3) fetches lazily on first open.
+    if index == 3 and not self.historyPending and #self.history == 0 then
         self:RequestHistory()
     end
     self:Refresh()
@@ -295,104 +503,67 @@ end
 ----------------------------------------------------------------
 
 function BB:BuildHuntTab(parent)
-    -- Reputation bar at the top
-    local repBox = CreateFrame("Frame", nil, parent)
-    repBox:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, 0)
-    repBox:SetPoint("TOPRIGHT", parent, "TOPRIGHT", 0, 0)
-    repBox:SetHeight(46)
-    setParchmentBackdrop(repBox)
-    parent.repBox = repBox
+    -- Reputation display has moved to the frame footer (see BB:BuildRepFooter);
+    -- this tab's content starts directly with the Active Contract panel.
 
-    repBox.rankText = repBox:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    repBox.rankText:SetPoint("TOPLEFT", repBox, "TOPLEFT", 10, -6)
-
-    repBox.pointsText = repBox:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    repBox.pointsText:SetPoint("TOPRIGHT", repBox, "TOPRIGHT", -10, -8)
-
-    repBox.bar = CreateFrame("StatusBar", nil, repBox)
-    repBox.bar:SetPoint("BOTTOMLEFT", repBox, "BOTTOMLEFT", 10, 8)
-    repBox.bar:SetPoint("BOTTOMRIGHT", repBox, "BOTTOMRIGHT", -10, 8)
-    repBox.bar:SetHeight(12)
-    repBox.bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
-    repBox.bar:SetStatusBarColor(0.9, 0.7, 0.2)
-    repBox.bar:SetMinMaxValues(0, 1)
-    repBox.bar:SetValue(0)
-
-    local barBg = repBox.bar:CreateTexture(nil, "BACKGROUND")
-    barBg:SetAllPoints(repBox.bar)
-    barBg:SetTexture(0, 0, 0, 0.5)
-
-    -- Active-title picker strip: a plain button that opens a context-style
-    -- dropdown. Much more reliable than UIDropDownMenuTemplate's own button
-    -- in 3.3.5a (whose click target is only the tiny arrow).
-    local titleBar = CreateFrame("Frame", nil, parent)
-    titleBar:SetPoint("TOPLEFT", repBox, "BOTTOMLEFT", 0, -4)
-    titleBar:SetPoint("TOPRIGHT", repBox, "BOTTOMRIGHT", 0, -4)
-    titleBar:SetHeight(26)
-    parent.titleBar = titleBar
-
-    local titleLabel = titleBar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    titleLabel:SetPoint("LEFT", titleBar, "LEFT", 6, 0)
-    titleLabel:SetText("Активный титул:")
-
-    local titleButton = CreateFrame("Button", nil, titleBar, "UIPanelButtonTemplate")
-    titleButton:SetPoint("LEFT", titleLabel, "RIGHT", 6, 0)
-    titleButton:SetPoint("RIGHT", titleBar, "RIGHT", -6, 0)
-    titleButton:SetHeight(22)
-    titleButton:SetText("«нет»")
-    titleButton:SetScript("OnClick", function(self)
-        if not BB._titleMenu then
-            BB._titleMenu = CreateFrame("Frame",
-                "NemesisBountyBoardTitleMenu", UIParent, "UIDropDownMenuTemplate")
-        end
-        UIDropDownMenu_Initialize(BB._titleMenu, BB.BuildTitleMenu, "MENU")
-        ToggleDropDownMenu(1, nil, BB._titleMenu, self, 0, 0)
-    end)
-    parent.titleButton = titleButton
-
-    -- Active bounty parchment panel
+    -- Active bounty parchment panel — anchored directly below the rep box
+    -- now that the active-title picker has moved to the frame header.
     local bountyBox = CreateFrame("Frame", nil, parent)
-    bountyBox:SetPoint("TOPLEFT", titleBar, "BOTTOMLEFT", 0, -4)
-    bountyBox:SetPoint("TOPRIGHT", titleBar, "BOTTOMRIGHT", 0, -4)
-    bountyBox:SetHeight(100)
-    setParchmentBackdrop(bountyBox)
+    bountyBox:SetPoint("TOPLEFT",  parent, "TOPLEFT",  0, 0)
+    bountyBox:SetPoint("TOPRIGHT", parent, "TOPRIGHT", 0, 0)
+    bountyBox:SetHeight(72)
+    setPageBackdrop(bountyBox)
     parent.bountyBox = bountyBox
 
     bountyBox.header = bountyBox:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    bountyBox.header:SetPoint("TOPLEFT", bountyBox, "TOPLEFT", 10, -6)
+    bountyBox.header:SetPoint("TOPLEFT", bountyBox, "TOPLEFT", 0, -5)
     bountyBox.header:SetText("|cffffd100Активный контракт|r")
 
-    bountyBox.title = bountyBox:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    bountyBox.title:SetPoint("TOPLEFT", bountyBox, "TOPLEFT", 10, -22)
-    bountyBox.title:SetPoint("TOPRIGHT", bountyBox, "TOPRIGHT", -10, -22)
+    bountyBox.title = bountyBox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    bountyBox.title:SetPoint("TOPLEFT", bountyBox, "TOPLEFT", 0, -18)
+    bountyBox.title:SetPoint("TOPRIGHT", bountyBox, "TOPRIGHT", 0, -18)
     bountyBox.title:SetJustifyH("LEFT")
 
     bountyBox.details = bountyBox:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    bountyBox.details:SetPoint("TOPLEFT", bountyBox, "TOPLEFT", 10, -44)
-    bountyBox.details:SetPoint("RIGHT", bountyBox, "RIGHT", -10, 0)
+    bountyBox.details:SetPoint("TOPLEFT", bountyBox, "TOPLEFT", 0, -34)
+    bountyBox.details:SetPoint("BOTTOMRIGHT", bountyBox, "BOTTOMRIGHT", 0, 4)
     bountyBox.details:SetJustifyH("LEFT")
     bountyBox.details:SetJustifyV("TOP")
-    bountyBox.details:SetHeight(50)
     bountyBox.details:SetWordWrap(true)
 
-    -- Zone nemesis list
-    local listHeader = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    listHeader:SetPoint("TOPLEFT", bountyBox, "BOTTOMLEFT", 0, -10)
-    listHeader:SetText("|cffffd100Немезиды в этой зоне|r")
-    parent.listHeader = listHeader
+end
 
-    local listBg = CreateFrame("Frame", nil, parent)
-    listBg:SetPoint("TOPLEFT", listHeader, "BOTTOMLEFT", 0, -4)
-    listBg:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", 0, 0)
-    setDialogBackdrop(listBg, 0.4)
-    parent.listBg = listBg
+----------------------------------------------------------------
+-- Tab 2: Немезиды — current-zone nemesis list (scrollable)
+----------------------------------------------------------------
+
+local MAX_ZONE_ROWS_TAB = 40      -- plenty of slots; scroll handles overflow
+
+function BB:BuildZoneTab(parent)
+    -- Header inside the tab.
+    local header = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    header:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -5)
+    header:SetText("|cffffd100Немезиды в этой зоне|r")
+    parent.header = header
+
+    -- Scroll frame filling the rest of the tab content area.
+    local scroll = CreateFrame("ScrollFrame",
+        "NemesisBountyBoardZoneScroll", parent, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT",     header, "BOTTOMLEFT",  0, -4)
+    scroll:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", 26, 64)
+    parent.scroll = scroll
+
+    local content = CreateFrame("Frame", nil, scroll)
+    content:SetSize(1, 1)                          -- size recalculated on render
+    scroll:SetScrollChild(content)
+    parent.scrollContent = content
 
     parent.rows = {}
-    for i = 1, MAX_ZONE_ROWS do
-        local row = CreateFrame("Button", nil, listBg)
+    for i = 1, MAX_ZONE_ROWS_TAB do
+        local row = CreateFrame("Button", nil, content)
         row:SetHeight(ROW_HEIGHT)
-        row:SetPoint("TOPLEFT",  listBg, "TOPLEFT",  6, -(4 + (i - 1) * ROW_HEIGHT))
-        row:SetPoint("TOPRIGHT", listBg, "TOPRIGHT", -6, -(4 + (i - 1) * ROW_HEIGHT))
+        row:SetPoint("TOPLEFT",  content, "TOPLEFT",  0, -((i - 1) * ROW_HEIGHT))
+        row:SetPoint("RIGHT",    content, "RIGHT",    0, 0)
         row.text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
         row.text:SetPoint("LEFT", row, "LEFT", 2, 0)
         row.text:SetPoint("RIGHT", row, "RIGHT", -2, 0)
@@ -408,7 +579,7 @@ function BB:BuildHuntTab(parent)
     end
 
     parent.emptyText = parent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    parent.emptyText:SetPoint("CENTER", listBg, "CENTER", 0, 0)
+    parent.emptyText:SetPoint("CENTER", parent, "CENTER", 0, 0)
     parent.emptyText:SetText("Тишина в зоне. Никого не помечено.")
     parent.emptyText:Hide()
 end
@@ -419,25 +590,14 @@ end
 
 local TITLE_IDS = { 180, 181, 182, 183, 184 }
 
--- Strip the "%s" placeholder and surrounding whitespace so the dropdown
--- shows just the title word (e.g. "Охотник", not "Охотник %s").
-local function cleanTitleName(name)
-    if not name then return "" end
-    name = name:gsub("%%s", "")
-    name = name:gsub("^%s+", ""):gsub("%s+$", "")
-    return name
-end
-
 -- Menu builder — invoked by UIDropDownMenu_Initialize each time the popup
 -- opens. Called as a method (self = the menu frame), so the signature
 -- is (self, level, menuList). We ignore all args and rebuild from scratch.
 function BB.BuildTitleMenu(_, level)
     local current = GetCurrentTitle and GetCurrentTitle() or -1
 
-    -- «снять» — clears active title.
     local info = UIDropDownMenu_CreateInfo()
     info.text = "«снять»"
-    info.notCheckable = false
     info.checked = (current == -1)
     info.func = function()
         SetCurrentTitle(-1)
@@ -447,10 +607,10 @@ function BB.BuildTitleMenu(_, level)
     UIDropDownMenu_AddButton(info, level)
 
     for _, titleId in ipairs(TITLE_IDS) do
-        if IsTitleKnown and IsTitleKnown(titleId) then
+        if IsTitleKnown and IsTitleKnown(titleId) == 1 then
             local name = cleanTitleName(GetTitleName and GetTitleName(titleId))
             if name ~= "" then
-                local id = titleId  -- fresh upvalue captured by the closure
+                local id = titleId
                 info = UIDropDownMenu_CreateInfo()
                 info.text = name
                 info.checked = (current == id)
@@ -466,9 +626,7 @@ function BB.BuildTitleMenu(_, level)
 end
 
 function BB:RefreshTitleButton()
-    if not self.frame then return end
-    local btn = self.frame.tabContent[1].titleButton
-    if not btn then return end
+    if not self.frame or not self.frame.titleDD then return end
 
     local current = GetCurrentTitle and GetCurrentTitle() or -1
     local text = "«нет»"
@@ -476,7 +634,7 @@ function BB:RefreshTitleButton()
         local name = cleanTitleName(GetTitleName(current))
         if name ~= "" then text = name end
     end
-    btn:SetText(text)
+    UIDropDownMenu_SetText(self.frame.titleDD, text)
 end
 
 function BB:FindActiveBountyNemesis()
@@ -515,26 +673,36 @@ function BB:RenderHuntTab()
     -- Title picker
     self:RefreshTitleButton()
 
-    -- Reputation
+    -- Reputation footer (frame-level widgets, shared across tabs).
+    local frame = self.frame
     local points, rank = self:ReadRepSnapshot()
     local rankName = RANK_NAMES[rank] or "—"
     local r, g, b = rankColorByTier(rank)
-    content.repBox.rankText:SetText(string.format("|cff%02x%02x%02xРанг %d — %s|r",
-        math.floor(r * 255), math.floor(g * 255), math.floor(b * 255), rank, rankName))
-
-    if rank >= 5 then
-        content.repBox.pointsText:SetText(string.format("%d очков (макс)", points))
-        content.repBox.bar:SetValue(1)
-    else
-        local nextThreshold = RANK_THRESHOLDS[rank + 1] or (points + 1)
-        local curThreshold  = RANK_THRESHOLDS[rank] or 0
-        local span = math.max(1, nextThreshold - curThreshold)
-        local progress = math.min(1, math.max(0, (points - curThreshold) / span))
-        content.repBox.pointsText:SetText(string.format("%d / %d",
-            points, nextThreshold))
-        content.repBox.bar:SetValue(progress)
+    if frame.repRankText then
+        frame.repRankText:SetText(string.format("|cff%02x%02x%02xРанг %d — %s|r",
+            math.floor(r * 255), math.floor(g * 255), math.floor(b * 255),
+            rank, rankName))
     end
-    content.repBox.bar:SetStatusBarColor(r, g, b)
+
+    if frame.repBar then
+        if rank >= 5 then
+            frame.repBar:SetValue(1)
+            if frame.repBarLabel then
+                frame.repBarLabel:SetText(string.format("%d (макс)", points))
+            end
+        else
+            local nextThreshold = RANK_THRESHOLDS[rank + 1] or (points + 1)
+            local curThreshold  = RANK_THRESHOLDS[rank] or 0
+            local span = math.max(1, nextThreshold - curThreshold)
+            local progress = math.min(1, math.max(0, (points - curThreshold) / span))
+            local curInTier = points - curThreshold
+            frame.repBar:SetValue(progress)
+            if frame.repBarLabel then
+                frame.repBarLabel:SetText(string.format("%d / %d", curInTier, span))
+            end
+        end
+        frame.repBar:SetStatusBarColor(r, g, b)
+    end
 
     -- Active bounty
     local bounty = self:FindActiveBountyNemesis()
@@ -556,12 +724,17 @@ function BB:RenderHuntTab()
             "|cffa0a0a0Посетите трактирщика, чтобы принять охоту на голову.|r")
     end
 
-    -- Zone nemeses list — matches by localized zone name (server sends zone
-    -- names already localized via GetAreaTableEntry, so both sides agree).
+end
+
+function BB:RenderZoneTab()
+    local content = self.frame.tabContent[2]
+    if not content or not content.rows then return end
+
+    -- Collect zone nemeses via WorldMap's locale-independent matcher.
     local zoneList = {}
-    local currentZoneName = GetRealZoneText and GetRealZoneText() or ""
+    local inZone = NT.WorldMap and NT.WorldMap.IsNemesisInCurrentZone
     for _, nemesis in pairs(NT.data.nemeses or {}) do
-        if nemesis.zoneName and nemesis.zoneName == currentZoneName then
+        if inZone and inZone(nemesis) then
             table.insert(zoneList, nemesis)
         end
     end
@@ -588,6 +761,16 @@ function BB:RenderHuntTab()
         end
     end
 
+    -- Resize scroll content to match filled row count so the scroll bar
+    -- reflects real overflow.
+    if content.scrollContent then
+        local rows = math.max(1, #zoneList)
+        content.scrollContent:SetHeight(rows * ROW_HEIGHT)
+        if content.scroll then
+            content.scrollContent:SetWidth(content.scroll:GetWidth())
+        end
+    end
+
     if #zoneList == 0 then
         content.emptyText:Show()
     else
@@ -601,45 +784,51 @@ end
 
 function BB:BuildHistoryTab(parent)
     local header = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    header:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, 0)
+    header:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -5)
     header:SetText("|cffffd100Завершённые контракты|r")
     parent.header = header
 
-    local listBg = CreateFrame("Frame", nil, parent)
-    listBg:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -6)
-    listBg:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", 0, 0)
-    setDialogBackdrop(listBg, 0.4)
-    parent.listBg = listBg
+    -- Scroll frame filling the rest of the tab content area (mirrors Zone tab).
+    local scroll = CreateFrame("ScrollFrame",
+        "NemesisBountyBoardHistoryScroll", parent, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT",     header, "BOTTOMLEFT",  0, -4)
+    scroll:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", 26, 64)
+    parent.scroll = scroll
+
+    local content = CreateFrame("Frame", nil, scroll)
+    content:SetSize(1, 1)                          -- size recalculated on render
+    scroll:SetScrollChild(content)
+    parent.scrollContent = content
 
     parent.rows = {}
     for i = 1, MAX_HISTORY_ROWS do
-        local row = CreateFrame("Frame", nil, listBg)
-        row:SetHeight(ROW_HEIGHT + 4)
-        row:SetPoint("TOPLEFT",  listBg, "TOPLEFT",  6, -(4 + (i - 1) * (ROW_HEIGHT + 4)))
-        row:SetPoint("TOPRIGHT", listBg, "TOPRIGHT", -6, -(4 + (i - 1) * (ROW_HEIGHT + 4)))
+        local row = CreateFrame("Frame", nil, content)
+        row:SetHeight(ROW_HEIGHT)
+        row:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -((i - 1) * ROW_HEIGHT))
+        row:SetPoint("RIGHT",   content, "RIGHT",   0, 0)
         row.left = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.left:SetPoint("LEFT", row, "LEFT", 4, 0)
+        row.left:SetPoint("LEFT", row, "LEFT", 2, 0)
         row.left:SetJustifyH("LEFT")
         row.right = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.right:SetPoint("RIGHT", row, "RIGHT", -4, 0)
+        row.right:SetPoint("RIGHT", row, "RIGHT", -2, 0)
         row.right:SetJustifyH("RIGHT")
         row:Hide()
         parent.rows[i] = row
     end
 
     parent.emptyText = parent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    parent.emptyText:SetPoint("CENTER", listBg, "CENTER", 0, 0)
+    parent.emptyText:SetPoint("CENTER", parent, "CENTER", 0, 0)
     parent.emptyText:SetText("Ни одного завершённого контракта.")
     parent.emptyText:Hide()
 
     parent.loadingText = parent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    parent.loadingText:SetPoint("CENTER", listBg, "CENTER", 0, 0)
+    parent.loadingText:SetPoint("CENTER", parent, "CENTER", 0, 0)
     parent.loadingText:SetText("|cffa0a0a0Загрузка...|r")
     parent.loadingText:Hide()
 end
 
 function BB:RenderHistoryTab()
-    local content = self.frame.tabContent[2]
+    local content = self.frame.tabContent[3]
     if not content then return end
 
     if self.historyPending then
@@ -667,6 +856,15 @@ function BB:RenderHistoryTab()
         end
     end
 
+    -- Resize scroll content so the scroll bar reflects real overflow.
+    if content.scrollContent then
+        local rows = math.max(1, #self.history)
+        content.scrollContent:SetHeight(rows * ROW_HEIGHT)
+        if content.scroll then
+            content.scrollContent:SetWidth(content.scroll:GetWidth())
+        end
+    end
+
     if #self.history == 0 then
         content.emptyText:Show()
     else
@@ -680,10 +878,12 @@ end
 
 function BB:Refresh()
     if not self.frame or not self.frame:IsShown() then return end
+    -- Rep footer renders on every refresh (always visible).
+    self:RenderHuntTab()
     if self.activeTab == 2 then
+        self:RenderZoneTab()
+    elseif self.activeTab == 3 then
         self:RenderHistoryTab()
-    else
-        self:RenderHuntTab()
     end
 end
 

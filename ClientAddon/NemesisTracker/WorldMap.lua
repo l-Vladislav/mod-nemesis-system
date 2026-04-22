@@ -233,6 +233,10 @@ local function isNemesisInCurrentZone(nemesis)
     return false
 end
 
+-- Public alias so other modules (e.g. BountyBoard) can reuse the same
+-- locale-independent current-zone check.
+WM.IsNemesisInCurrentZone = isNemesisInCurrentZone
+
 local function navigateToNemesisZone(nemesis)
     if not nemesis then
         return

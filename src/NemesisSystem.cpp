@@ -3089,6 +3089,38 @@ namespace NemesisBountyBoard
         return true;
     }
 
+    // Server-wide announce helpers. Gated by config flags so operators can
+    // turn them off on crowded realms where the chat spam would be annoying.
+    // Red color (|cffff0000) plus the [Немезида] prefix the core module
+    // already uses for its other announcements.
+    void AnnounceAccept(Player* player, std::string const& title)
+    {
+        if (!player) return;
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.BountyBoard.AnnounceAccept", true))
+            return;
+        // "|cffff0000[Немезида]: {} принял(а) контракт на {}!|r"
+        std::string msg = Acore::StringFormat(
+            "|cffff0000[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} "
+            "\xD0\xBF\xD1\x80\xD0\xB8\xD0\xBD\xD1\x8F\xD0\xBB(\xD0\xB0) "
+            "\xD0\xBA\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xBD\xD0\xB0 {}!|r",
+            player->GetName(), title);
+        sWorldSessionMgr->SendServerMessage(SERVER_MSG_STRING, msg);
+    }
+
+    void AnnounceCompletion(Player* player, std::string const& title)
+    {
+        if (!player) return;
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.BountyBoard.AnnounceCompletion", true))
+            return;
+        // "|cffff0000[Немезида]: {} выполнил(а) контракт на {}!|r"
+        std::string msg = Acore::StringFormat(
+            "|cffff0000[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} "
+            "\xD0\xB2\xD1\x8B\xD0\xBF\xD0\xBE\xD0\xBB\xD0\xBD\xD0\xB8\xD0\xBB(\xD0\xB0) "
+            "\xD0\xBA\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xBD\xD0\xB0 {}!|r",
+            player->GetName(), title);
+        sWorldSessionMgr->SendServerMessage(SERVER_MSG_STRING, msg);
+    }
+
     // Accepts a bounty contract — writes the row (REPLACE replaces any
     // leftover row, but the UI flow already prompts abandon before accept).
     // zoneId is the innkeeper's zone — used for the per-zone completion cap.
@@ -3111,6 +3143,8 @@ namespace NemesisBountyBoard
             "(`guid`, `target_spawn_id`, `target_title`, `zone_id`, `accepted_at`, `expires_at`) "
             "VALUES ({}, {}, '{}', {}, {}, {})",
             guidLow, uint32(b.spawnId), title, zoneId, now, expires);
+
+        AnnounceAccept(player, b.title);
     }
 
     void AbandonBounty(Player* player)
@@ -3389,6 +3423,8 @@ namespace NemesisBountyBoard
 
         outTitle = active.targetTitle;
         outRank = rank;
+
+        AnnounceCompletion(player, active.targetTitle);
         return true;
     }
 }
