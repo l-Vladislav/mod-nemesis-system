@@ -469,12 +469,16 @@ NemesisSystem.BountyVendor.FamiliarRank = 3
 NemesisSystem.AmbientGeneration.Enable = 1
 
 #
-#    NemesisSystem.AmbientGeneration.IntervalSeconds
-#        Description: Seconds between generation passes. Clamped to >= 30.
-#        Default:     300
+#    NemesisSystem.AmbientGeneration.IntervalMinSeconds
+#    NemesisSystem.AmbientGeneration.IntervalMaxSeconds
+#        Description: Each generation pass is followed by a RANDOM pause of
+#                     [Min, Max] seconds, so births don't land on a fixed
+#                     rhythm. Min is clamped to >= 30, Max to >= Min.
+#        Default:     300 / 600 (5-10 minutes)
 #
 
-NemesisSystem.AmbientGeneration.IntervalSeconds = 300
+NemesisSystem.AmbientGeneration.IntervalMinSeconds = 300
+NemesisSystem.AmbientGeneration.IntervalMaxSeconds = 600
 
 #
 #    NemesisSystem.AmbientGeneration.FillPercent

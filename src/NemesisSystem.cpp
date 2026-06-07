@@ -2232,9 +2232,10 @@ namespace  // reopen anon ns
             if (picks.empty())
                 continue;
 
-            // Single pass over the map's spawned creatures (only grids near
-            // players are loaded — exactly where births should happen);
-            // reservoir-sample one eligible candidate per zone.
+            // Single pass over the map's spawned creatures. Grids are loaded
+            // around ALL characters (playerbots included), so the candidate
+            // pool spans the whole inhabited zone — not just the real
+            // player's surroundings. Reservoir-sample one candidate per zone.
             for (auto const& pair : map->GetCreatureBySpawnIdStore())
             {
                 Creature* candidate = pair.second;
@@ -4604,17 +4605,28 @@ public:
         if (!sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.Enable", true))
             return;
 
+        if (!_nextTickMs)
+            _nextTickMs = RollNextInterval();
+
         _timer += diff;
-        uint32 const intervalMs = std::max<uint32>(30, sConfigMgr->GetOption<uint32>("NemesisSystem.AmbientGeneration.IntervalSeconds", 300)) * IN_MILLISECONDS;
-        if (_timer < intervalMs)
+        if (_timer < _nextTickMs)
             return;
         _timer = 0;
+        _nextTickMs = RollNextInterval();  // randomized cadence (5-10 min default)
 
         RunAmbientGenerationTick();
     }
 
 private:
+    static uint32 RollNextInterval()
+    {
+        uint32 const minSec = std::max<uint32>(30, sConfigMgr->GetOption<uint32>("NemesisSystem.AmbientGeneration.IntervalMinSeconds", 300));
+        uint32 const maxSec = std::max<uint32>(minSec, sConfigMgr->GetOption<uint32>("NemesisSystem.AmbientGeneration.IntervalMaxSeconds", 600));
+        return urand(minSec, maxSec) * IN_MILLISECONDS;
+    }
+
     uint32 _timer = 0;
+    uint32 _nextTickMs = 0;
 };
 
 void AddSC_mod_nemesis_system()
