@@ -212,13 +212,12 @@ local function isNemesisInCurrentZone(nemesis)
         return false
     end
 
-    -- Dungeon branch: 3.3.5 instances have no world-map files, so the
-    -- file-name match below can never succeed inside one. Match the entry's
-    -- server-provided zone name against the client's real zone text instead
-    -- (both come from the same ruRU AreaTable).
+    -- Dungeon branch: 3.3.5 instances have no world-map files and zone-name
+    -- matching is unreliable (subzones, map-vs-zone name). The server pushes
+    -- the current dungeon mapId (V2:DUNGEON); match the entry's mapId to it.
     if IsInInstance and IsInInstance() then
-        local here = GetRealZoneText and GetRealZoneText()
-        return here ~= nil and here ~= "" and nemesis.zoneName == here
+        local cur = NT.data and NT.data.currentDungeonMapId
+        return cur ~= nil and cur ~= 0 and nemesis.mapId == cur
     end
 
     -- Primary: compare locale-independent map file names

@@ -788,6 +788,13 @@ function NT:ParseServerPayload(payload)
         end
         return
     end
+    if opcode == "DUNGEON" then
+        -- Server tells us the current dungeon mapId (0 = open world) so the
+        -- zone tab can match dungeon nemeses by mapId.
+        self.data.currentDungeonMapId = tonumber(fields[3]) or 0
+        scheduleRefresh()
+        return
+    end
     if opcode == "BOOTSTRAP_BEGIN" then
         self:BeginBootstrap(fields[3])
         return

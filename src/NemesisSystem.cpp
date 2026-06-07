@@ -364,6 +364,10 @@ namespace
     // grids BEFORE the player lands in the map's player list — spawn-time
     // player checks see an empty map.
     std::unordered_set<uint32> RealDungeonInstances;
+    // instanceId -> last presence-message timestamp, to debounce the dungeon
+    // "you sense a strong enemy" line (individual deep-dungeon spawns would
+    // otherwise each emit one).
+    std::unordered_map<uint32, uint32> LastDungeonPresenceTs;
     bool CacheLoaded = false;
 
     constexpr char NEMESIS_ADDON_PREFIX[] = "Nemesis";
@@ -2418,9 +2422,16 @@ namespace  // reopen anon ns
     }
 
     // Single atmospheric dungeon announcement (owner 2026-06-07): no names,
-    // no ranks - the group just senses the danger. Map-local only.
+    // no ranks - the group just senses the danger. Map-local + debounced per
+    // instance so trickle spawns deeper in the dungeon don't spam the line.
     void AnnounceDungeonPresence(Map* map)
     {
+        uint32 const now = uint32(GameTime::GetGameTime().count());
+        uint32 const cooldown = sConfigMgr->GetOption<uint32>("NemesisSystem.DungeonNemesis.PresenceCooldownSeconds", 120);
+        uint32& last = LastDungeonPresenceTs[map->GetInstanceId()];
+        if (last && now - last < cooldown)
+            return;
+        last = now;
         AnnounceToMap(map, "\u0412\u044b \u0447\u0443\u0432\u0441\u0442\u0432\u0443\u0435\u0442\u0435 \u043f\u0440\u0438\u0441\u0443\u0442\u0441\u0442\u0432\u0438\u0435 \u0441\u0438\u043b\u044c\u043d\u043e\u0433\u043e \u0432\u0440\u0430\u0433\u0430 \u0432 \u044d\u0442\u043e\u043c \u043c\u0435\u0441\u0442\u0435.");
     }
 
@@ -2917,11 +2928,9 @@ public:
                 ? Acore::StringFormat("{} \xD0\xBE\xD1\x82\xD0\xBC\xD1\x81\xD1\x82\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank)
                 : Acore::StringFormat("{} \xD1\x83\xD1\x81\xD1\x82\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank);
 
-            // Dungeon nemesis kills stay map-local (owner 2026-06-07) - the
-            // whole server does not need a feed of every instance run.
-            if (killed->GetMap() && killed->GetMap()->IsDungeon())
-                AnnounceToMap(killed->GetMap(), message);
-            else
+            // Dungeon nemesis kills are SILENT (owner 2026-06-07) — no global
+            // and no map feed; the titled corpse is announcement enough.
+            if (!(killed->GetMap() && killed->GetMap()->IsDungeon()))
                 BroadcastNemesisMessage(killed, message);
         }
     }
@@ -3108,11 +3117,28 @@ public:
         if (!TryGetNemesisState(creature, state))
             return;
 
-        if (creature->IsAlive())
+        if (!creature->IsAlive())
+        {
+            EraseRegenAccumulator(creature);
+            DeleteNemesisState(creature, "dead");
             return;
+        }
 
-        EraseRegenAccumulator(creature);
-        DeleteNemesisState(creature, "dead");
+        // Self-heal scaled max health. A creature re-init (JUST_RESPAWNED ->
+        // SelectLevel -> InitStatsForLevel, which a freshly entered dungeon's
+        // creatures hit on their first Update) resets UNIT_MOD_HEALTH
+        // BASE_VALUE to the template base, wiping our scaled max health while
+        // leaving scale intact (model big, HP normal). Re-assert when the
+        // live max has drifted BELOW target; preserve the current health %
+        // so this never becomes a heal loop in combat. Fires once per drift
+        // (ApplyNemesisState restores the BASE_VALUE mod).
+        uint32 const expectedMax = std::max<uint32>(1, uint32(float(state.baseHealth) * GetHealthMultiplier(state.rank)));
+        if (creature->GetMaxHealth() < expectedMax)
+        {
+            float const pct = creature->GetHealthPct();
+            ApplyNemesisState(creature, state);
+            creature->SetHealth(std::max<uint32>(1, uint32(float(expectedMax) * pct / 100.0f)));
+        }
     }
 };
 
@@ -5304,7 +5330,17 @@ public:
 
     void OnPlayerEnterAll(Map* map, Player* player) override
     {
-        if (!map || !player || !map->IsDungeon())
+        if (!map || !player)
+            return;
+
+        // Tell the addon the player's current dungeon mapId (0 = open world)
+        // so its zone tab can match dungeon nemeses by mapId — instances have
+        // no world-map file and zone-name matching is unreliable (subzones).
+        if (player->GetSession())
+            SendAddonPayload(player, Acore::StringFormat("V2:DUNGEON:{}",
+                map->IsDungeon() ? map->GetId() : 0u));
+
+        if (!map->IsDungeon())
             return;
         if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
             return;
@@ -5344,7 +5380,10 @@ public:
     void OnDestroyMap(Map* map) override
     {
         if (map && map->IsDungeon())
+        {
             RealDungeonInstances.erase(map->GetInstanceId());
+            LastDungeonPresenceTs.erase(map->GetInstanceId());
+        }
     }
 };
 
