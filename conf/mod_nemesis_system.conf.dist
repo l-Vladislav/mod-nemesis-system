@@ -452,6 +452,68 @@ NemesisSystem.BountyVendor.StatBoosterRank = 2
 
 NemesisSystem.BountyVendor.FamiliarRank = 3
 
+########################################
+# AMBIENT NEMESIS GENERATION
+########################################
+
+#
+#    NemesisSystem.AmbientGeneration.Enable
+#        Description: Periodically promote a random eligible mob to nemesis in
+#                     open-world zones occupied by players, while the zone has
+#                     fewer nemeses than FillPercent of MaxPerZone.
+#                     One birth per zone per tick. Births have no victim
+#                     (nemesis_target_guid = 0).
+#        Default:     1 - Enabled
+#
+
+NemesisSystem.AmbientGeneration.Enable = 1
+
+#
+#    NemesisSystem.AmbientGeneration.IntervalSeconds
+#        Description: Seconds between generation passes. Clamped to >= 30.
+#        Default:     300
+#
+
+NemesisSystem.AmbientGeneration.IntervalSeconds = 300
+
+#
+#    NemesisSystem.AmbientGeneration.FillPercent
+#        Description: Target fill level as a percent of NemesisSystem.MaxPerZone.
+#                     A zone below this share of the cap gets one ambient birth
+#                     per tick. Requires a finite MaxPerZone (0 disables ambient).
+#        Default:     50
+#
+
+NemesisSystem.AmbientGeneration.FillPercent = 50
+
+#
+#    NemesisSystem.AmbientGeneration.RequireRealPlayers
+#        Description: Only consider zones holding at least one REAL player
+#                     (playerbots do not count). With 0, bot-populated zones
+#                     also breed nemeses — the whole world fills up.
+#        Default:     1
+#
+
+NemesisSystem.AmbientGeneration.RequireRealPlayers = 1
+
+#
+#    NemesisSystem.AmbientGeneration.Announce
+#        Description: Announce ambient births with creature-type flavor text
+#                     ("...вкусил(а) крови и обрёл(а) силу немезиды!").
+#        Default:     1
+#
+
+NemesisSystem.AmbientGeneration.Announce = 1
+
+#
+#    NemesisSystem.AmbientGeneration.AnnounceZoneOnly
+#        Description: Send the birth announcement only to players in the zone
+#                     where it happened (0 = server-wide system message).
+#        Default:     1
+#
+
+NemesisSystem.AmbientGeneration.AnnounceZoneOnly = 1
+
 ###############################################################################
 # BOUNTY BOARD SETTINGS
 #

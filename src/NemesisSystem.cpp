@@ -1552,7 +1552,7 @@ namespace  // reopen anon ns
         state.baseAttackTime = killer->GetCreatureTemplate()->BaseAttackTime;
         state.baseRangeAttackTime = killer->GetCreatureTemplate()->RangeAttackTime;
         state.baseRunSpeedRate = killer->GetSpeedRate(MOVE_RUN);
-        state.targetGuid = killed->GetGUID().GetCounter();
+        state.targetGuid = killed ? killed->GetGUID().GetCounter() : 0;  // 0 = ambient-born, no victim
         state.createdAt = uint32(GameTime::GetGameTime().count());
         state.lastSeenAt = state.createdAt;
         return state;
@@ -2050,6 +2050,215 @@ namespace  // reopen anon ns
             BroadcastNemesisMessage(killer, message, reachedRankFive);
         }
     }
+
+    // ========================================================================
+    // Ambient nemesis generation (2026-06-07).
+    // Periodically promotes a random eligible mob in zones occupied by (real)
+    // players while the zone holds fewer nemeses than FillPercent of
+    // NemesisSystem.MaxPerZone. One birth per zone per tick. Births carry
+    // targetGuid=0 (no victim). The same promote path is intended for future
+    // dungeon generation (spawn-on-enter) — keep it map-agnostic.
+    // ========================================================================
+
+    // Birth-announcement flavor by creature_template.type. Seeded pick keeps
+    // repeated logs varied. Gendered endings follow the module's "стал(а)" style.
+    std::string AmbientBirthFlavor(uint32 creatureType, uint32 seed)
+    {
+        static char const* const beastLines[] = {
+            "\u043e\u0434\u0435\u0440\u0436\u0430\u043b(\u0430) \u0432\u0435\u0440\u0445 \u0432 \u0441\u043c\u0435\u0440\u0442\u0435\u043b\u044c\u043d\u043e\u0439 \u0441\u0445\u0432\u0430\u0442\u043a\u0435 \u0437\u0430 \u0442\u0435\u0440\u0440\u0438\u0442\u043e\u0440\u0438\u044e \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+            "\u0432\u043a\u0443\u0441\u0438\u043b(\u0430) \u043a\u0440\u043e\u0432\u0438 \u0438 \u043e\u0431\u0440\u0451\u043b(\u0430) \u0441\u0438\u043b\u0443 \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u044b!",
+        };
+        static char const* const dragonLines[] = {
+            "\u043f\u0440\u043e\u0431\u0443\u0434\u0438\u043b(\u0430) \u0434\u0440\u0435\u0432\u043d\u044e\u044e \u043a\u0440\u043e\u0432\u044c \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+            "\u0432\u0441\u043f\u043e\u043c\u043d\u0438\u043b(\u0430) \u043c\u043e\u0449\u044c \u043f\u0440\u0435\u0434\u043a\u043e\u0432 \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+        };
+        static char const* const demonLines[] = {
+            "\u043d\u0430\u043f\u0438\u0442\u0430\u043b\u0441\u044f(\u0430\u0441\u044c) \u044d\u043d\u0435\u0440\u0433\u0438\u0435\u0439 \u0421\u043a\u0432\u0435\u0440\u043d\u044b \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+            "\u0437\u0430\u043a\u043b\u044e\u0447\u0438\u043b(\u0430) \u0442\u0451\u043c\u043d\u0443\u044e \u0441\u0434\u0435\u043b\u043a\u0443 \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+        };
+        static char const* const elementalLines[] = {
+            "\u043f\u043e\u0433\u043b\u043e\u0442\u0438\u043b(\u0430) \u044f\u0440\u043e\u0441\u0442\u044c \u0441\u0442\u0438\u0445\u0438\u0439 \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+            "\u0432\u043e\u0431\u0440\u0430\u043b(\u0430) \u0432 \u0441\u0435\u0431\u044f \u0441\u0438\u043b\u0443 \u0431\u0443\u0440\u0438 \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+        };
+        static char const* const giantLines[] = {
+            "\u0441\u043e\u043a\u0440\u0443\u0448\u0438\u043b(\u0430) \u0432\u0441\u0435\u0445 \u0441\u043e\u043f\u0435\u0440\u043d\u0438\u043a\u043e\u0432 \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+            "\u043f\u043e\u0434\u043d\u044f\u043b\u0441\u044f(\u0430\u0441\u044c) \u0438\u0437 \u0433\u043b\u0443\u0431\u0438\u043d \u0437\u0435\u043c\u043b\u0438 \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+        };
+        static char const* const undeadLines[] = {
+            "\u043e\u0442\u043a\u0430\u0437\u0430\u043b\u0441\u044f(\u0430\u0441\u044c) \u0443\u0445\u043e\u0434\u0438\u0442\u044c \u0432 \u043d\u0435\u0431\u044b\u0442\u0438\u0435 \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+            "\u0432\u043f\u0438\u0442\u0430\u043b(\u0430) \u0441\u0438\u043b\u0443 \u043f\u0440\u043e\u043a\u043b\u044f\u0442\u044b\u0445 \u0437\u0435\u043c\u0435\u043b\u044c \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+        };
+        static char const* const humanoidLines[] = {
+            "\u043f\u043e\u0441\u0442\u0438\u0433(\u043b\u0430) \u0437\u0430\u043f\u0440\u0435\u0442\u043d\u044b\u0435 \u0437\u043d\u0430\u043d\u0438\u044f \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+            "\u043f\u0440\u043e\u0448\u0451\u043b(\u0448\u043b\u0430) \u043f\u0443\u0442\u044c \u043e\u0442 \u0438\u0437\u0433\u043e\u044f \u0434\u043e \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u044b!",
+        };
+        static char const* const mechanicalLines[] = {
+            "\u043f\u0435\u0440\u0435\u043d\u0430\u0441\u0442\u0440\u043e\u0438\u043b(\u0430) \u0441\u0432\u043e\u0438 \u043f\u0440\u043e\u0442\u043e\u043a\u043e\u043b\u044b \u043d\u0430 \u0443\u043d\u0438\u0447\u0442\u043e\u0436\u0435\u043d\u0438\u0435 \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+            "\u0432\u044b\u0448\u0435\u043b(\u0448\u043b\u0430) \u0438\u0437-\u043f\u043e\u0434 \u043a\u043e\u043d\u0442\u0440\u043e\u043b\u044f \u0441\u043e\u0437\u0434\u0430\u0442\u0435\u043b\u0435\u0439 \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+        };
+        static char const* const defaultLines[] = {
+            "\u043e\u0431\u0440\u0451\u043b(\u0430) \u043d\u0435\u0432\u0438\u0434\u0430\u043d\u043d\u0443\u044e \u0441\u0438\u043b\u0443 \u0438 \u0441\u0442\u0430\u043b(\u0430) \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u043e\u0439!",
+        };
+
+        char const* const* lines = defaultLines;
+        uint32 count = 1;
+        switch (creatureType)
+        {
+            case CREATURE_TYPE_BEAST:      lines = beastLines;      count = 2; break;
+            case CREATURE_TYPE_DRAGONKIN:  lines = dragonLines;     count = 2; break;
+            case CREATURE_TYPE_DEMON:      lines = demonLines;      count = 2; break;
+            case CREATURE_TYPE_ELEMENTAL:  lines = elementalLines;  count = 2; break;
+            case CREATURE_TYPE_GIANT:      lines = giantLines;      count = 2; break;
+            case CREATURE_TYPE_UNDEAD:     lines = undeadLines;     count = 2; break;
+            case CREATURE_TYPE_HUMANOID:   lines = humanoidLines;   count = 2; break;
+            case CREATURE_TYPE_MECHANICAL: lines = mechanicalLines; count = 2; break;
+            default: break;
+        }
+        return lines[seed % count];
+    }
+
+    bool IsEligibleAmbientCandidate(Creature* creature)
+    {
+        if (!creature || !creature->IsInWorld() || !creature->IsAlive() || !creature->GetSpawnId())
+            return false;
+
+        if (creature->IsPet() || creature->IsCritter() || creature->IsTotem() || creature->IsTrigger())
+            return false;
+
+        // Friendly/service NPCs never become ambient nemeses.
+        CreatureTemplate const* tmpl = creature->GetCreatureTemplate();
+        if (!tmpl || tmpl->npcflag != 0 || creature->IsCivilian())
+            return false;
+
+        if (!creature->IsHostileToPlayers())
+            return false;
+
+        if (!IsAllowedCreatureRank(tmpl->rank))
+            return false;
+
+        // Rares are pool-driven (entry-keyed dedup against player targets) —
+        // ambient births with targetGuid=0 would fracture that; skip them.
+        if (IsRareEntry(creature->GetEntry()))
+            return false;
+
+        if (creature->IsDungeonBoss() || creature->isWorldBoss())
+            return false;
+
+        uint8 const level = creature->GetLevel();
+        if (level < GetMinCreatureLevel() || level > GetMaxCreatureLevel())
+            return false;
+
+        NemesisState existing;
+        if (TryGetNemesisState(creature, existing))
+            return false;
+
+        return true;
+    }
+
+    // Victimless promotion. Mirrors PromoteNemesis minus rare dedup (rares are
+    // filtered out by eligibility) and the victim-bound addon push.
+    void PromoteAmbientNemesis(Creature* creature)
+    {
+        uint32 const now = uint32(GameTime::GetGameTime().count());
+
+        NemesisState state = BuildInitialNemesisState(creature, nullptr);
+        state.lastPromotionAt = now;
+        RollAffixes(state);
+
+        SaveNemesisState(creature, state, 0);
+        ApplyNemesisState(creature, state);
+        creature->SetFullHealth();
+
+        if (sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.Announce", true))
+        {
+            // GetName() already returns the generated nemesis title here —
+            // ApplyNemesisState ran above.
+            std::string const message = Acore::StringFormat("[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: {} {}",
+                creature->GetName(), AmbientBirthFlavor(creature->GetCreatureTemplate()->type, uint32(creature->GetSpawnId())));
+
+            if (sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.AnnounceZoneOnly", true))
+            {
+                uint32 const zoneId = creature->GetZoneId();
+                Map::PlayerList const& players = creature->GetMap()->GetPlayers();
+                for (auto itr = players.begin(); itr != players.end(); ++itr)
+                    if (Player* player = itr->GetSource())
+                        if (player->GetZoneId() == zoneId && player->GetSession())
+                            ChatHandler(player->GetSession()).SendSysMessage(message);
+            }
+            else
+                BroadcastNemesisMessage(creature, message, false);
+        }
+    }
+
+    // One generation pass. Returns the number of births. Also callable from
+    // the .nemesis ambient admin command for deterministic testing.
+    uint32 RunAmbientGenerationTick()
+    {
+        uint32 const maxPerZone = GetMaxPerZone();
+        if (!maxPerZone)
+            return 0;  // ambient refill needs a finite per-zone cap
+
+        uint32 const fillPercent = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NemesisSystem.AmbientGeneration.FillPercent", 50));
+        uint32 const fillTarget = maxPerZone * fillPercent / 100;
+        if (!fillTarget)
+            return 0;
+
+        bool const realOnly = sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.RequireRealPlayers", true);
+
+        // Open-world zones currently holding qualifying players, per map.
+        std::unordered_map<Map*, std::vector<uint32>> zonesByMap;
+        ForEachOnlinePlayer([&](Player* player)
+        {
+            if (!player->IsInWorld())
+                return;
+            if (realOnly && IsPlayerbotVictim(player))
+                return;
+            Map* map = player->GetMap();
+            if (!map || map->IsDungeon() || map->IsBattlegroundOrArena() || map->IsRaid())
+                return;
+            std::vector<uint32>& zones = zonesByMap[map];
+            if (std::find(zones.begin(), zones.end(), player->GetZoneId()) == zones.end())
+                zones.push_back(player->GetZoneId());
+        });
+
+        uint32 births = 0;
+        for (auto const& [map, zones] : zonesByMap)
+        {
+            // Zones still below the fill target → reservoir slot (pick, seen).
+            std::unordered_map<uint32, std::pair<Creature*, uint32>> picks;
+            for (uint32 zoneId : zones)
+                if (CountNemesesInZone(zoneId) < fillTarget)
+                    picks.emplace(zoneId, std::make_pair(nullptr, 0u));
+            if (picks.empty())
+                continue;
+
+            // Single pass over the map's spawned creatures (only grids near
+            // players are loaded — exactly where births should happen);
+            // reservoir-sample one eligible candidate per zone.
+            for (auto const& pair : map->GetCreatureBySpawnIdStore())
+            {
+                Creature* candidate = pair.second;
+                if (!candidate)
+                    continue;
+                auto it = picks.find(candidate->GetZoneId());
+                if (it == picks.end())
+                    continue;
+                if (!IsEligibleAmbientCandidate(candidate))
+                    continue;
+                ++it->second.second;
+                if (urand(1, it->second.second) == 1)
+                    it->second.first = candidate;
+            }
+
+            for (auto& [zoneId, pick] : picks)
+                if (pick.first)
+                {
+                    PromoteAmbientNemesis(pick.first);
+                    ++births;
+                }
+        }
+        return births;
+    }
 }
 
 // Forward declaration for the bounty board completion check (full impl lives
@@ -2464,7 +2673,8 @@ public:
             { "mapclear", HandleMapClear, SEC_GAMEMASTER, Console::No },
             { "clearall", HandleClearAll, SEC_ADMINISTRATOR, Console::Yes },
             { "reload", HandleReload, SEC_ADMINISTRATOR, Console::Yes },
-            { "merge-rares", HandleMergeRares, SEC_ADMINISTRATOR, Console::Yes }
+            { "merge-rares", HandleMergeRares, SEC_ADMINISTRATOR, Console::Yes },
+            { "ambient", HandleAmbient, SEC_GAMEMASTER, Console::Yes }
         };
 
         static ChatCommandTable commandTable =
@@ -2473,6 +2683,14 @@ public:
         };
 
         return commandTable;
+    }
+
+    // Force one ambient-generation pass (same code the periodic tick runs).
+    static bool HandleAmbient(ChatHandler* handler)
+    {
+        uint32 const births = RunAmbientGenerationTick();
+        handler->PSendSysMessage("Nemesis ambient tick: {} new nemeses.", births);
+        return true;
     }
 
     static bool HandleAddonBootstrap(ChatHandler* handler)
@@ -4370,6 +4588,35 @@ private:
     }
 };
 
+// ============================================================================
+// Ambient nemesis generation tick. See RunAmbientGenerationTick for the pass
+// itself; this script only paces it.
+// ============================================================================
+class NemesisAmbientWorldScript : public WorldScript
+{
+public:
+    NemesisAmbientWorldScript() : WorldScript("NemesisAmbientWorldScript") { }
+
+    void OnUpdate(uint32 diff) override
+    {
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
+            return;
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.Enable", true))
+            return;
+
+        _timer += diff;
+        uint32 const intervalMs = std::max<uint32>(30, sConfigMgr->GetOption<uint32>("NemesisSystem.AmbientGeneration.IntervalSeconds", 300)) * IN_MILLISECONDS;
+        if (_timer < intervalMs)
+            return;
+        _timer = 0;
+
+        RunAmbientGenerationTick();
+    }
+
+private:
+    uint32 _timer = 0;
+};
+
 void AddSC_mod_nemesis_system()
 {
     new NemesisSystemPlayerScript();
@@ -4377,4 +4624,5 @@ void AddSC_mod_nemesis_system()
     new NemesisSystemUnitScript();
     new NemesisSystemCommandScript();
     new NemesisBountyVendorScript();
+    new NemesisAmbientWorldScript();
 }
