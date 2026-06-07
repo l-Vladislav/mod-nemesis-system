@@ -491,6 +491,17 @@ NemesisSystem.AmbientGeneration.IntervalMaxSeconds = 600
 NemesisSystem.AmbientGeneration.FillPercent = 50
 
 #
+#    NemesisSystem.AmbientGeneration.RankUpChance
+#        Description: Percent chance (0-100) that a zone's ambient action
+#                     RANKS UP an existing live nemesis of that zone instead
+#                     of creating a new one. Honors the regular rank-up
+#                     cooldown; falls back to a birth when no candidate.
+#        Default:     10
+#
+
+NemesisSystem.AmbientGeneration.RankUpChance = 10
+
+#
 #    NemesisSystem.AmbientGeneration.RequireRealPlayers
 #        Description: Only consider zones holding at least one REAL player
 #                     (playerbots do not count). With 0, bot-populated zones

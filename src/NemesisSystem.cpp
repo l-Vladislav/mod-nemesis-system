@@ -2155,6 +2155,25 @@ namespace  // reopen anon ns
         return true;
     }
 
+    // Ambient announcements: zone-local by default, server-wide otherwise.
+    void AnnounceAmbient(Creature* creature, std::string const& message)
+    {
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.Announce", true))
+            return;
+
+        if (sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.AnnounceZoneOnly", true))
+        {
+            uint32 const zoneId = creature->GetZoneId();
+            Map::PlayerList const& players = creature->GetMap()->GetPlayers();
+            for (auto itr = players.begin(); itr != players.end(); ++itr)
+                if (Player* player = itr->GetSource())
+                    if (player->GetZoneId() == zoneId && player->GetSession())
+                        ChatHandler(player->GetSession()).SendSysMessage(message);
+        }
+        else
+            BroadcastNemesisMessage(creature, message, false);
+    }
+
     // Victimless promotion. Mirrors PromoteNemesis minus rare dedup (rares are
     // filtered out by eligibility) and the victim-bound addon push.
     void PromoteAmbientNemesis(Creature* creature)
@@ -2169,39 +2188,57 @@ namespace  // reopen anon ns
         ApplyNemesisState(creature, state);
         creature->SetFullHealth();
 
-        if (sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.Announce", true))
-        {
-            // GetName() already returns the generated nemesis title here —
-            // ApplyNemesisState ran above.
-            std::string const message = Acore::StringFormat("[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: {} {}",
-                creature->GetName(), AmbientBirthFlavor(creature->GetCreatureTemplate()->type, uint32(creature->GetSpawnId())));
-
-            if (sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.AnnounceZoneOnly", true))
-            {
-                uint32 const zoneId = creature->GetZoneId();
-                Map::PlayerList const& players = creature->GetMap()->GetPlayers();
-                for (auto itr = players.begin(); itr != players.end(); ++itr)
-                    if (Player* player = itr->GetSource())
-                        if (player->GetZoneId() == zoneId && player->GetSession())
-                            ChatHandler(player->GetSession()).SendSysMessage(message);
-            }
-            else
-                BroadcastNemesisMessage(creature, message, false);
-        }
+        // GetName() already returns the generated nemesis title here -
+        // ApplyNemesisState ran above.
+        AnnounceAmbient(creature, Acore::StringFormat("[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: {} {}",
+            creature->GetName(), AmbientBirthFlavor(creature->GetCreatureTemplate()->type, uint32(creature->GetSpawnId()))));
     }
 
-    // One generation pass. Returns the number of births. Also callable from
-    // the .nemesis ambient admin command for deterministic testing.
-    uint32 RunAmbientGenerationTick()
+    // Ambient rank-up: an existing zone nemesis grows stronger instead of a
+    // new one being born (RankUpChance). Mirrors the rank-up branch of
+    // PromoteNemesis; honors the regular rank-up cooldown.
+    bool AmbientRankUpNemesis(Creature* creature)
     {
+        NemesisState state;
+        if (!TryGetNemesisState(creature, state))
+            return false;
+        if (state.rank >= GetMaxRank() || GetRankUpCooldownRemaining(state) > 0)
+            return false;
+
+        uint32 const now = uint32(GameTime::GetGameTime().count());
+        ++state.rank;
+        state.lastPromotionAt = now;
+        state.lastSeenAt = now;
+        RollAffixes(state);
+
+        SaveNemesisState(creature, state, 0);
+        ApplyNemesisState(creature, state);
+        creature->SetFullHealth();
+        BroadcastRankFiveNemesisIfPersistent(creature, state);
+
+        // "...набирает силу и достигает ранга N!"
+        AnnounceAmbient(creature, Acore::StringFormat("[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: {} \u043d\u0430\u0431\u0438\u0440\u0430\u0435\u0442 \u0441\u0438\u043b\u0443 \u0438 \u0434\u043e\u0441\u0442\u0438\u0433\u0430\u0435\u0442 \u0440\u0430\u043d\u0433\u0430 {}!",
+            creature->GetName(), state.rank));
+        return true;
+    }
+
+    // One generation pass. With RankUpChance percent, a zone's action becomes
+    // a rank-up of an existing live nemesis instead of a new birth (falls
+    // back to a birth when no rank-up candidate exists). Also callable from
+    // the .nemesis ambient admin command for deterministic testing.
+    void RunAmbientGenerationTick(uint32& births, uint32& rankUps)
+    {
+        births = 0;
+        rankUps = 0;
+
         uint32 const maxPerZone = GetMaxPerZone();
         if (!maxPerZone)
-            return 0;  // ambient refill needs a finite per-zone cap
+            return;  // ambient refill needs a finite per-zone cap
 
         uint32 const fillPercent = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NemesisSystem.AmbientGeneration.FillPercent", 50));
         uint32 const fillTarget = maxPerZone * fillPercent / 100;
         if (!fillTarget)
-            return 0;
+            return;
 
         bool const realOnly = sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.RequireRealPlayers", true);
 
@@ -2221,14 +2258,25 @@ namespace  // reopen anon ns
                 zones.push_back(player->GetZoneId());
         });
 
-        uint32 births = 0;
+        uint32 const rankUpChance = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NemesisSystem.AmbientGeneration.RankUpChance", 10));
+
+        // Per-zone reservoirs: a fresh-birth candidate and a rank-up candidate
+        // (an existing live nemesis off its rank-up cooldown).
+        struct AmbientSlot
+        {
+            Creature* birth = nullptr;
+            uint32 birthSeen = 0;
+            Creature* rankUp = nullptr;
+            uint32 rankUpSeen = 0;
+        };
+
         for (auto const& [map, zones] : zonesByMap)
         {
-            // Zones still below the fill target → reservoir slot (pick, seen).
-            std::unordered_map<uint32, std::pair<Creature*, uint32>> picks;
+            // Zones still below the fill target get a slot.
+            std::unordered_map<uint32, AmbientSlot> picks;
             for (uint32 zoneId : zones)
                 if (CountNemesesInZone(zoneId) < fillTarget)
-                    picks.emplace(zoneId, std::make_pair(nullptr, 0u));
+                    picks.emplace(zoneId, AmbientSlot());
             if (picks.empty())
                 continue;
 
@@ -2244,21 +2292,45 @@ namespace  // reopen anon ns
                 auto it = picks.find(candidate->GetZoneId());
                 if (it == picks.end())
                     continue;
+
+                NemesisState st;
+                if (TryGetNemesisState(candidate, st))
+                {
+                    // Existing nemesis → rank-up reservoir (skip rares: their
+                    // state rows are keyed to player targets).
+                    if (candidate->IsAlive() && st.rank < GetMaxRank()
+                        && !IsRareEntry(candidate->GetEntry())
+                        && GetRankUpCooldownRemaining(st) == 0)
+                    {
+                        ++it->second.rankUpSeen;
+                        if (urand(1, it->second.rankUpSeen) == 1)
+                            it->second.rankUp = candidate;
+                    }
+                    continue;
+                }
+
                 if (!IsEligibleAmbientCandidate(candidate))
                     continue;
-                ++it->second.second;
-                if (urand(1, it->second.second) == 1)
-                    it->second.first = candidate;
+                ++it->second.birthSeen;
+                if (urand(1, it->second.birthSeen) == 1)
+                    it->second.birth = candidate;
             }
 
-            for (auto& [zoneId, pick] : picks)
-                if (pick.first)
+            for (auto& [zoneId, slot] : picks)
+            {
+                bool const wantRankUp = rankUpChance && urand(1, 100) <= rankUpChance;
+                if (wantRankUp && slot.rankUp && AmbientRankUpNemesis(slot.rankUp))
                 {
-                    PromoteAmbientNemesis(pick.first);
+                    ++rankUps;
+                    continue;
+                }
+                if (slot.birth)
+                {
+                    PromoteAmbientNemesis(slot.birth);
                     ++births;
                 }
+            }
         }
-        return births;
     }
 }
 
@@ -2689,8 +2761,10 @@ public:
     // Force one ambient-generation pass (same code the periodic tick runs).
     static bool HandleAmbient(ChatHandler* handler)
     {
-        uint32 const births = RunAmbientGenerationTick();
-        handler->PSendSysMessage("Nemesis ambient tick: {} new nemeses.", births);
+        uint32 births = 0;
+        uint32 rankUps = 0;
+        RunAmbientGenerationTick(births, rankUps);
+        handler->PSendSysMessage("Nemesis ambient tick: {} births, {} rank-ups.", births, rankUps);
         return true;
     }
 
@@ -4600,11 +4674,9 @@ public:
 
     void OnUpdate(uint32 diff) override
     {
-        if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
-            return;
-        if (!sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.Enable", true))
-            return;
-
+        // Config is read only when the timer fires (plus one roll at startup).
+        // A per-world-tick GetOption would hammer the config map and spam
+        // "Missing property" warnings when a key is absent from the .conf.
         if (!_nextTickMs)
             _nextTickMs = RollNextInterval();
 
@@ -4614,7 +4686,14 @@ public:
         _timer = 0;
         _nextTickMs = RollNextInterval();  // randomized cadence (5-10 min default)
 
-        RunAmbientGenerationTick();
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
+            return;
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.Enable", true))
+            return;
+
+        uint32 births = 0;
+        uint32 rankUps = 0;
+        RunAmbientGenerationTick(births, rankUps);
     }
 
 private:
