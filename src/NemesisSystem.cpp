@@ -2056,11 +2056,11 @@ namespace  // reopen anon ns
         if (ShouldAnnounceCreate() && state.rank >= GetAnnounceMinRank())
         {
             bool const reachedRankFive = existed && previousRank < 5 && state.rank >= 5;
-            // [Немезида]: Бесопожар Обжористый достиг ранга 3!
-            // [Немезида]: Бесопожар Обжористый стал(а) немезидой, убив Caraco!
+            // Бесопожар Обжористый достиг ранга 3!
+            // Бесопожар Обжористый стал(а) немезидой, убив Caraco!
             std::string message = existed
-                ? Acore::StringFormat("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} \xD0\xB4\xD0\xBE\xD1\x81\xD1\x82\xD0\xB8\xD0\xB3 \xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3\xD0\xB0 {}!", killer->GetName(), state.rank)
-                : Acore::StringFormat("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} \xD1\x81\xD1\x82\xD0\xB0\xD0\xBB(\xD0\xB0) \xD0\xBD\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xBE\xD0\xB9, \xD1\x83\xD0\xB1\xD0\xB8\xD0\xB2 {}!", killer->GetName(), killed->GetName());
+                ? Acore::StringFormat("{} \xD0\xB4\xD0\xBE\xD1\x81\xD1\x82\xD0\xB8\xD0\xB3 \xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3\xD0\xB0 {}!", killer->GetName(), state.rank)
+                : Acore::StringFormat("{} \xD1\x81\xD1\x82\xD0\xB0\xD0\xBB(\xD0\xB0) \xD0\xBD\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xBE\xD0\xB9, \xD1\x83\xD0\xB1\xD0\xB8\xD0\xB2 {}!", killer->GetName(), killed->GetName());
             BroadcastNemesisMessage(killer, message, reachedRankFive);
         }
     }
@@ -2204,7 +2204,7 @@ namespace  // reopen anon ns
 
         // GetName() already returns the generated nemesis title here -
         // ApplyNemesisState ran above.
-        AnnounceAmbient(creature, Acore::StringFormat("[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: {} {}",
+        AnnounceAmbient(creature, Acore::StringFormat("{} {}",
             creature->GetName(), AmbientBirthFlavor(creature->GetCreatureTemplate()->type, uint32(creature->GetSpawnId()))));
     }
 
@@ -2231,7 +2231,7 @@ namespace  // reopen anon ns
         BroadcastRankFiveNemesisIfPersistent(creature, state);
 
         // "...набирает силу и достигает ранга N!"
-        AnnounceAmbient(creature, Acore::StringFormat("[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: {} \u043d\u0430\u0431\u0438\u0440\u0430\u0435\u0442 \u0441\u0438\u043b\u0443 \u0438 \u0434\u043e\u0441\u0442\u0438\u0433\u0430\u0435\u0442 \u0440\u0430\u043d\u0433\u0430 {}!",
+        AnnounceAmbient(creature, Acore::StringFormat("{} \u043d\u0430\u0431\u0438\u0440\u0430\u0435\u0442 \u0441\u0438\u043b\u0443 \u0438 \u0434\u043e\u0441\u0442\u0438\u0433\u0430\u0435\u0442 \u0440\u0430\u043d\u0433\u0430 {}!",
             creature->GetName(), state.rank));
         return true;
     }
@@ -2443,8 +2443,8 @@ namespace  // reopen anon ns
             if (Player* player = itr->GetSource())
                 SendValidatedNemesisUpsert(player, creature->GetSpawnId(), state);
 
-        // "[Немезида]: {} затаился(ась) в этом подземелье (ранг N)!"
-        AnnounceToMap(map, Acore::StringFormat("[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: {} \u0437\u0430\u0442\u0430\u0438\u043b\u0441\u044f(\u0430\u0441\u044c) \u0432 \u044d\u0442\u043e\u043c \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435 (\u0440\u0430\u043d\u0433 {})!",
+        // "{} затаился(ась) в этом подземелье (ранг N)!"
+        AnnounceToMap(map, Acore::StringFormat("{} \u0437\u0430\u0442\u0430\u0438\u043b\u0441\u044f(\u0430\u0441\u044c) \u0432 \u044d\u0442\u043e\u043c \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435 (\u0440\u0430\u043d\u0433 {})!",
             creature->GetName(), state.rank));
     }
 }
@@ -2607,6 +2607,58 @@ namespace NemesisSpecialTask
         Persist(player, st);
     }
 
+    // Reward is ALWAYS mailed (owner request 2026-06-07) with varied RP
+    // flavor from the innkeeper (creature 190002 — the bounty mail sender).
+    void SendTaskRewardMail(Player* player, uint8 type, uint32 itemId, uint32 count)
+    {
+        static char const* const subjects[] = {
+            "\u041d\u0430\u0433\u0440\u0430\u0434\u0430 \u0437\u0430 \u043e\u0441\u043e\u0431\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435",
+            "\u041c\u043e\u043d\u0435\u0442\u0430 \u0430\u0432\u0430\u043d\u0442\u044e\u0440\u0438\u0441\u0442\u0430",
+            "\u0417\u0430 \u0432\u0435\u0440\u043d\u0443\u044e \u0441\u043b\u0443\u0436\u0431\u0443",
+            "\u041f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d\u043e",
+        };
+
+        static char const* const speedBodies[] = {
+            "\u0411\u044b\u0441\u0442\u0440\u043e \u0441\u0440\u0430\u0431\u043e\u0442\u0430\u043d\u043e! \u041c\u043e\u043b\u0432\u0430 \u043e \u0442\u0430\u043a\u043e\u0439 \u043f\u0440\u044b\u0442\u0438 \u0440\u0430\u0437\u043b\u0435\u0442\u0438\u0442\u0441\u044f \u043f\u043e \u0442\u0430\u0432\u0435\u0440\u043d\u0430\u043c.\n\n\u0414\u0435\u0440\u0436\u0438 \u0441\u0432\u043e\u044e \u043c\u043e\u043d\u0435\u0442\u0443.",
+            "\u041d\u0435 \u0443\u0441\u043f\u0435\u043b \u044f \u0434\u043e\u043f\u0438\u0442\u044c \u043a\u0440\u0443\u0436\u043a\u0443, \u0430 \u0434\u0435\u043b\u043e \u0443\u0436\u0435 \u0441\u0434\u0435\u043b\u0430\u043d\u043e.\n\n\u0417\u0430\u0441\u043b\u0443\u0436\u0435\u043d\u043d\u0430\u044f \u043d\u0430\u0433\u0440\u0430\u0434\u0430.",
+            "\u0421\u043a\u043e\u0440\u043e\u0441\u0442\u044c - \u0442\u0432\u043e\u0451 \u0432\u0442\u043e\u0440\u043e\u0435 \u0438\u043c\u044f.\n\n\u041c\u043e\u043d\u0435\u0442\u0430 \u0442\u0432\u043e\u044f \u043f\u043e \u043f\u0440\u0430\u0432\u0443.",
+        };
+        static char const* const continentBodies[] = {
+            "\u0414\u0430\u043b\u044c\u043d\u044f\u044f \u0434\u043e\u0440\u043e\u0433\u0430, \u0447\u0443\u0436\u0438\u0435 \u0437\u0435\u043c\u043b\u0438 - \u0430 \u0442\u044b \u0441\u043f\u0440\u0430\u0432\u0438\u043b\u0441\u044f.\n\n\u041c\u043e\u043d\u0435\u0442\u0430 \u0442\u0432\u043e\u044f.",
+            "\u0413\u043e\u0432\u043e\u0440\u044f\u0442, \u0442\u0435\u0431\u044f \u0432\u0438\u0434\u0435\u043b\u0438 \u0437\u0430 \u043c\u043e\u0440\u0435\u043c. \u0421\u043b\u0443\u0445\u0438 \u043d\u0435 \u0432\u0440\u0443\u0442.\n\n\u0412\u043e\u0442 \u0442\u0432\u043e\u044f \u043d\u0430\u0433\u0440\u0430\u0434\u0430.",
+            "\u0427\u0435\u0440\u0435\u0437 \u043e\u043a\u0435\u0430\u043d \u0437\u0430 \u0433\u043e\u043b\u043e\u0432\u043e\u0439 \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u044b - \u0442\u0430\u043a\u043e\u0435 \u0437\u0430\u043f\u043e\u043c\u043d\u044f\u0442.\n\n\u0414\u0435\u0440\u0436\u0438 \u043c\u043e\u043d\u0435\u0442\u0443.",
+        };
+        static char const* const dungeonBodies[] = {
+            "\u0414\u0430\u0436\u0435 \u0432 \u0442\u0451\u043c\u043d\u044b\u0445 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u044f\u0445 \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0430\u043c \u043d\u0435 \u0441\u043a\u0440\u044b\u0442\u044c\u0441\u044f \u043e\u0442 \u0442\u0435\u0431\u044f.\n\n\u041d\u0430\u0433\u0440\u0430\u0434\u0430 \u0432\u043d\u0443\u0442\u0440\u0438.",
+            "\u0418\u0437 \u0442\u0430\u043a\u0438\u0445 \u0433\u043b\u0443\u0431\u0438\u043d \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442\u0441\u044f \u043d\u0435 \u043a\u0430\u0436\u0434\u044b\u0439.\n\n\u041c\u043e\u043d\u0435\u0442\u0430 - \u0442\u0432\u043e\u044f.",
+            "\u041f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u044f \u0448\u0435\u043f\u0447\u0443\u0442 \u043e \u0442\u0432\u043e\u0435\u0439 \u043e\u0445\u043e\u0442\u0435.\n\n\u0417\u0430\u0441\u043b\u0443\u0436\u0435\u043d\u043e.",
+        };
+
+        char const* const* bodies = speedBodies;
+        switch (type)
+        {
+            case TASK_CONTINENT: bodies = continentBodies; break;
+            case TASK_DUNGEON:   bodies = dungeonBodies;   break;
+            default: break;
+        }
+
+        std::string const subject = subjects[urand(0, 3)];
+        std::string const body = bodies[urand(0, 2)];
+
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+        MailDraft draft(subject, body);
+        if (Item* item = Item::CreateItem(itemId, count, player))
+        {
+            item->SaveToDB(trans);
+            draft.AddItem(item);
+        }
+        draft.SendMailTo(trans,
+            MailReceiver(player, player->GetGUID().GetCounter()),
+            MailSender(MAIL_CREATURE, 190002),  // virtual "Innkeeper" mail sender
+            MAIL_CHECK_MASK_NONE, 0);
+        CharacterDatabase.CommitTransaction(trans);
+    }
+
     // Called per reward recipient when a nemesis (persistent or temporary)
     // dies. Group members each check their own task.
     void OnNemesisKilled(Player* player, Creature* killed)
@@ -2632,8 +2684,8 @@ namespace NemesisSpecialTask
                     st.acceptedAt = 0;
                     Persist(player, st);
                     ChatHandler(player->GetSession()).PSendSysMessage(
-                        // "[Немезида]: Время вышло. Возьми поручение у трактирщика заново."
-                        "[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: \u0412\u0440\u0435\u043c\u044f \u0432\u044b\u0448\u043b\u043e. \u0412\u043e\u0437\u044c\u043c\u0438 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0443 \u0442\u0440\u0430\u043a\u0442\u0438\u0440\u0449\u0438\u043a\u0430 \u0437\u0430\u043d\u043e\u0432\u043e.");
+                        // "Время вышло. Возьми поручение у трактирщика заново."
+                        "\u0412\u0440\u0435\u043c\u044f \u0432\u044b\u0448\u043b\u043e. \u0412\u043e\u0437\u044c\u043c\u0438 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0443 \u0442\u0440\u0430\u043a\u0442\u0438\u0440\u0449\u0438\u043a\u0430 \u0437\u0430\u043d\u043e\u0432\u043e.");
                 }
                 break;
             case TASK_CONTINENT:
@@ -2655,11 +2707,11 @@ namespace NemesisSpecialTask
 
         uint32 const rewardItem = sConfigMgr->GetOption<uint32>("NemesisSpecialTask.RewardItem", 110150);
         uint32 const rewardCount = sConfigMgr->GetOption<uint32>("NemesisSpecialTask.RewardCount", 1);
-        AddItemOrMail(player, rewardItem, rewardCount);
+        SendTaskRewardMail(player, st.type, rewardItem, rewardCount);
 
         ChatHandler(player->GetSession()).PSendSysMessage(
-            // "[Немезида]: Особое поручение выполнено! Награда: Монета авантюриста."
-            "[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: \u041e\u0441\u043e\u0431\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d\u043e! \u041d\u0430\u0433\u0440\u0430\u0434\u0430: \u041c\u043e\u043d\u0435\u0442\u0430 \u0430\u0432\u0430\u043d\u0442\u044e\u0440\u0438\u0441\u0442\u0430.");
+            // "Особое поручение выполнено! Награда отправлена почтой."
+            "\u041e\u0441\u043e\u0431\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d\u043e! \u041d\u0430\u0433\u0440\u0430\u0434\u0430 \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0430 \u043f\u043e\u0447\u0442\u043e\u0439.");
     }
 }
 
@@ -2754,7 +2806,6 @@ public:
             if (NemesisBountyBoard::CheckCompletion(recipient, killed, bountyTitle, bountyRank))
             {
                 ChatHandler(recipient->GetSession()).PSendSysMessage(
-                    "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
                     "\xD0\x9A\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xB2\xD1\x8B\xD0\xBF\xD0\xBE\xD0\xBB\xD0\xBD\xD0\xB5\xD0\xBD: {}",  // "Контракт выполнен: {}"
                     bountyTitle);
 
@@ -2777,11 +2828,11 @@ public:
 
         if (ShouldAnnounceKill() && state.rank >= GetAnnounceMinRank())
         {
-            // [Немезида]: Honktu отомстил(а) Поганоглаз Ненасытный (ранг 1)!
-            // [Немезида]: Fehkadrit устранил(а) Бесошлён Прожорливый (ранг 1)!
+            // Honktu отомстил(а) Поганоглаз Ненасытный (ранг 1)!
+            // Fehkadrit устранил(а) Бесошлён Прожорливый (ранг 1)!
             std::string message = revenge
-                ? Acore::StringFormat("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} \xD0\xBE\xD1\x82\xD0\xBC\xD1\x81\xD1\x82\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank)
-                : Acore::StringFormat("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} \xD1\x83\xD1\x81\xD1\x82\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank);
+                ? Acore::StringFormat("{} \xD0\xBE\xD1\x82\xD0\xBC\xD1\x81\xD1\x82\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank)
+                : Acore::StringFormat("{} \xD1\x83\xD1\x81\xD1\x82\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank);
             BroadcastNemesisMessage(killed, message);
         }
     }
@@ -3829,8 +3880,7 @@ namespace NemesisBountyBoard
             // Notify once; subsequent calls find no row and return early.
             // Client addon parses this to clear its bounty highlight.
             ChatHandler(player->GetSession()).PSendSysMessage(
-                // "[Немезида]: Контракт на {} истёк."
-                "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
+                // "Контракт на {} истёк."
                 "\xD0\x9A\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 "
                 "\xD0\xBD\xD0\xB0 {} "
                 "\xD0\xB8\xD1\x81\xD1\x82\xD1\x91\xD0\xBA.",
@@ -3850,9 +3900,9 @@ namespace NemesisBountyBoard
         if (!player) return;
         if (!sConfigMgr->GetOption<bool>("NemesisSystem.BountyBoard.AnnounceAccept", true))
             return;
-        // "|cffff0000[Немезида]: {} принял(а) контракт на {}!|r"
+        // "|cffff0000{} принял(а) контракт на {}!|r"
         std::string msg = Acore::StringFormat(
-            "|cffff0000[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} "
+            "|cffff0000{} "
             "\xD0\xBF\xD1\x80\xD0\xB8\xD0\xBD\xD1\x8F\xD0\xBB(\xD0\xB0) "
             "\xD0\xBA\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xBD\xD0\xB0 {}!|r",
             player->GetName(), title);
@@ -3864,9 +3914,9 @@ namespace NemesisBountyBoard
         if (!player) return;
         if (!sConfigMgr->GetOption<bool>("NemesisSystem.BountyBoard.AnnounceCompletion", true))
             return;
-        // "|cffff0000[Немезида]: {} выполнил(а) контракт на {}!|r"
+        // "|cffff0000{} выполнил(а) контракт на {}!|r"
         std::string msg = Acore::StringFormat(
-            "|cffff0000[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} "
+            "|cffff0000{} "
             "\xD0\xB2\xD1\x8B\xD0\xBF\xD0\xBE\xD0\xBB\xD0\xBD\xD0\xB8\xD0\xBB(\xD0\xB0) "
             "\xD0\xBA\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xBD\xD0\xB0 {}!|r",
             player->GetName(), title);
@@ -4004,8 +4054,7 @@ namespace NemesisBountyBoard
             if (Player* online = ObjectAccessor::FindConnectedPlayer(recvGuid))
             {
                 ChatHandler(online->GetSession()).PSendSysMessage(
-                    // "[Немезида]: Контракт на {} отменён (цель устранена)."
-                    "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
+                    // "Контракт на {} отменён (цель устранена)."
                     "\xD0\x9A\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xBD\xD0\xB0 {} \xD0\xBE\xD1\x82\xD0\xBC\xD0\xB5\xD0\xBD\xD1\x91\xD0\xBD "
                     "(\xD1\x86\xD0\xB5\xD0\xBB\xD1\x8C \xD1\x83\xD1\x81\xD1\x82\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xB0).",
                     a.title);
@@ -4314,8 +4363,7 @@ namespace NemesisReputation
             rankedUp = true;
 
             ChatHandler(player->GetSession()).PSendSysMessage(
-                // "[Немезида]: Новый ранг — {}."
-                "[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: "
+                // "Новый ранг — {}."
                 "\u041d\u043e\u0432\u044b\u0439 \u0440\u0430\u043d\u0433 \u2014 {}.",
                 GetRankName(newRank));
         }
@@ -4533,7 +4581,7 @@ public:
             std::string err;
             if (!NemesisSpecialTask::Accept(player, type, err))
                 ChatHandler(player->GetSession()).PSendSysMessage(
-                    "[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: {}", err);
+                    "{}", err);
             ShowSpecialTask(player, creature);
             return true;
         }
@@ -4561,8 +4609,7 @@ public:
             if (NemesisReputation::GetRank(player) < need)
             {
                 ChatHandler(player->GetSession()).PSendSysMessage(
-                    // "[Немезида]: Эти товары доступны с ранга «{}»."
-                    "[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: "
+                    // "Эти товары доступны с ранга «{}»."
                     "\u042d\u0442\u0438 \u0442\u043e\u0432\u0430\u0440\u044b \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b "
                     "\u0441 \u0440\u0430\u043d\u0433\u0430 \u00ab{}\u00bb.",
                     NemesisReputation::GetRankName(need));
@@ -4596,7 +4643,6 @@ public:
             NemesisBountyBoard::AbandonBounty(player);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 // "Контракт отменён."
-                "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
                 "\xD0\x9A\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xBE\xD1\x82\xD0\xBC\xD0\xB5\xD0\xBD\xD1\x91\xD0\xBD.");
             ShowBoard(player, creature);
             return true;
@@ -4621,7 +4667,6 @@ public:
             {
                 ChatHandler(player->GetSession()).PSendSysMessage(
                     // "У вас уже есть активный контракт. Откажитесь сначала."
-                    "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
                     "\xD0\xA3 \xD0\xB2\xD0\xB0\xD1\x81 \xD1\x83\xD0\xB6\xD0\xB5 \xD0\xB5\xD1\x81\xD1\x82\xD1\x8C \xD0\xB0\xD0\xBA\xD1\x82\xD0\xB8\xD0\xB2\xD0\xBD\xD1\x8B\xD0\xB9 \xD0\xBA\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82.");
                 ShowActiveBounty(player, creature);
                 return true;
@@ -4641,8 +4686,7 @@ public:
             if (capCompletions >= NemesisBountyBoard::GetSlotsPerDay())
             {
                 ChatHandler(player->GetSession()).PSendSysMessage(
-                    // "[Немезида]: На сегодня с тебя хватит. Возвращайся позже."
-                    "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
+                    // "На сегодня с тебя хватит. Возвращайся позже."
                     "\xD0\x9D\xD0\xB0 \xD1\x81\xD0\xB5\xD0\xB3\xD0\xBE\xD0\xB4\xD0\xBD\xD1\x8F \xD1\x81 \xD1\x82\xD0\xB5\xD0\xB1\xD1\x8F \xD1\x85\xD0\xB2\xD0\xB0\xD1\x82\xD0\xB8\xD1\x82. "
                     "\xD0\x92\xD0\xBE\xD0\xB7\xD0\xB2\xD1\x80\xD0\xB0\xD1\x89\xD0\xB0\xD0\xB9\xD1\x81\xD1\x8F \xD0\xBF\xD0\xBE\xD0\xB7\xD0\xB6\xD0\xB5.");
                 ShowBoard(player, creature);
@@ -4665,8 +4709,7 @@ public:
             if (bountyIt == ActiveNemeses.end() || bountyIt->second.zoneId != creature->GetZoneId())
             {
                 ChatHandler(player->GetSession()).PSendSysMessage(
-                    // "[Немезида]: Цель ускользнула. Попробуй другой контракт."
-                    "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
+                    // "Цель ускользнула. Попробуй другой контракт."
                     "\xD0\xA6\xD0\xB5\xD0\xBB\xD1\x8C \xD1\x83\xD1\x81\xD0\xBA\xD0\xBE\xD0\xBB\xD1\x8C\xD0\xB7\xD0\xBD\xD1\x83\xD0\xBB\xD0\xB0. \xD0\x9F\xD0\xBE\xD0\xBF\xD1\x80\xD0\xBE\xD0\xB1\xD1\x83\xD0\xB9 \xD0\xB4\xD1\x80\xD1\x83\xD0\xB3\xD0\xBE\xD0\xB9 \xD0\xBA\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82.");
                 ShowBoard(player, creature);
                 return true;
@@ -4677,7 +4720,6 @@ public:
             uint32 const tokens = NemesisBountyBoard::GetRewardTokens(b.rank);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 // "Контракт принят: {} (награда {} жет.)"
-                "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
                 "\xD0\x9A\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xBF\xD1\x80\xD0\xB8\xD0\xBD\xD1\x8F\xD1\x82: {} (\xD0\xBD\xD0\xB0\xD0\xB3\xD1\x80\xD0\xB0\xD0\xB4\xD0\xB0 {} \xD0\xB6\xD0\xB5\xD1\x82.)",
                 b.title, tokens);
 
