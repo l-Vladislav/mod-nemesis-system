@@ -1381,15 +1381,20 @@ namespace
         if (!creature)
             return false;
 
+        // Temporary store FIRST: dungeon nemeses are temp-keyed by ObjectGuid
+        // even though their creatures carry spawnIds (spawnIds collide across
+        // instances of the same dungeon and must never reach the DB path).
+        TemporaryNemesisStore::iterator itr = ActiveTemporaryNemeses.find(creature->GetGUID());
+        if (itr != ActiveTemporaryNemeses.end())
+        {
+            state = itr->second;
+            return true;
+        }
+
         if (ObjectGuid::LowType const spawnId = creature->GetSpawnId())
             return TryGetNemesisState(spawnId, state);
 
-        TemporaryNemesisStore::iterator itr = ActiveTemporaryNemeses.find(creature->GetGUID());
-        if (itr == ActiveTemporaryNemeses.end())
-            return false;
-
-        state = itr->second;
-        return true;
+        return false;
     }
 
     // Save a nemesis state. Normally the DB key is creature->GetSpawnId(),
@@ -1494,13 +1499,20 @@ namespace  // reopen anon ns
         if (!creature)
             return;
 
+        // Temp entry first (dungeon nemeses have spawnIds but live temp-only).
+        if (ActiveTemporaryNemeses.erase(creature->GetGUID()))
+        {
+            TemporaryRegenTickAccumulators.erase(creature->GetGUID());
+            (void)reason;
+            return;
+        }
+
         if (ObjectGuid::LowType const spawnId = creature->GetSpawnId())
         {
             DeleteNemesisState(spawnId, reason);
             return;
         }
 
-        ActiveTemporaryNemeses.erase(creature->GetGUID());
         TemporaryRegenTickAccumulators.erase(creature->GetGUID());
         (void)reason;
     }
@@ -1510,23 +1522,25 @@ namespace  // reopen anon ns
         if (!creature)
             return;
 
+        TemporaryRegenTickAccumulators.erase(creature->GetGUID());
         if (ObjectGuid::LowType const spawnId = creature->GetSpawnId())
             RegenTickAccumulators.erase(spawnId);
-        else
-            TemporaryRegenTickAccumulators.erase(creature->GetGUID());
     }
 
     uint32& GetRegenAccumulator(Creature* creature)
     {
-        if (ObjectGuid::LowType const spawnId = creature->GetSpawnId())
-            return RegenTickAccumulators[spawnId];
+        // Temp-resident creatures (City Siege summons, dungeon nemeses) tick
+        // on the guid-keyed accumulator even when they carry a spawnId.
+        if (!creature->GetSpawnId() || ActiveTemporaryNemeses.count(creature->GetGUID()))
+            return TemporaryRegenTickAccumulators[creature->GetGUID()];
 
-        return TemporaryRegenTickAccumulators[creature->GetGUID()];
+        return RegenTickAccumulators[creature->GetSpawnId()];
     }
 
     void BroadcastRankFiveNemesisIfPersistent(Creature* creature, NemesisState const& state)
     {
-        if (!creature || !creature->GetSpawnId())
+        // Temps (incl. dungeon nemeses with spawnIds) never broadcast rank 5.
+        if (!creature || !creature->GetSpawnId() || ActiveTemporaryNemeses.count(creature->GetGUID()))
             return;
 
         BroadcastRankFiveNemesis(creature->GetSpawnId(), state);
@@ -2332,6 +2346,107 @@ namespace  // reopen anon ns
             }
         }
     }
+
+    // ========================================================================
+    // Dungeon nemesis generation (2026-06-07). Creatures spawning in dungeon
+    // maps roll a small chance to become a TEMPORARY nemesis with a weighted
+    // random rank. Temp-keyed by ObjectGuid, NEVER persisted (spawnIds repeat
+    // across instances of the same dungeon). Dies with the instance.
+    // ========================================================================
+
+    uint8 RollDungeonNemesisRank()
+    {
+        // 50/30/15/4/1 toward low ranks, clipped to the configured MaxRank.
+        static uint8 const weights[5] = { 50, 30, 15, 4, 1 };
+        uint8 const maxRank = std::min<uint8>(5, GetMaxRank());
+        uint32 total = 0;
+        for (uint8 i = 0; i < maxRank; ++i)
+            total += weights[i];
+        uint32 roll = urand(1, total);
+        for (uint8 i = 0; i < maxRank; ++i)
+        {
+            if (roll <= weights[i])
+                return i + 1;
+            roll -= weights[i];
+        }
+        return 1;
+    }
+
+    bool MapHasRealPlayer(Map* map)
+    {
+        Map::PlayerList const& players = map->GetPlayers();
+        for (auto itr = players.begin(); itr != players.end(); ++itr)
+            if (Player* player = itr->GetSource())
+                if (!IsPlayerbotVictim(player))
+                    return true;
+        return false;
+    }
+
+    void AnnounceToMap(Map* map, std::string const& message)
+    {
+        Map::PlayerList const& players = map->GetPlayers();
+        for (auto itr = players.begin(); itr != players.end(); ++itr)
+            if (Player* player = itr->GetSource())
+                if (player->GetSession())
+                    ChatHandler(player->GetSession()).SendSysMessage(message);
+    }
+
+    void TryRollDungeonNemesis(Creature* creature)
+    {
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
+            return;
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.Enable", true))
+            return;
+
+        Map* map = creature->GetMap();
+        if (!map || !map->IsDungeon() || map->IsBattlegroundOrArena())
+            return;
+        if (map->IsRaid() && !sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.IncludeRaids", false))
+            return;
+
+        // Trash and elites only — bosses keep their scripted encounters.
+        if (!creature->IsAlive() || creature->IsPet() || creature->IsCritter()
+            || creature->IsTotem() || creature->IsTrigger())
+            return;
+        CreatureTemplate const* tmpl = creature->GetCreatureTemplate();
+        if (!tmpl || tmpl->npcflag != 0 || creature->IsCivilian())
+            return;
+        if (tmpl->rank != CREATURE_ELITE_NORMAL && tmpl->rank != CREATURE_ELITE_ELITE)
+            return;
+        if (creature->IsDungeonBoss() || creature->isWorldBoss())
+            return;
+        if (!creature->IsHostileToPlayers())
+            return;
+
+        if (sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.RequireRealPlayers", true)
+            && !MapHasRealPlayer(map))
+            return;
+
+        float const chance = sConfigMgr->GetOption<float>("NemesisSystem.DungeonNemesis.Chance", 3.0f);
+        if (chance <= 0.0f || !roll_chance_f(chance))
+            return;
+
+        NemesisState state = BuildInitialNemesisState(creature, nullptr);
+        state.rank = RollDungeonNemesisRank();
+        state.lastPromotionAt = state.createdAt;
+        RollAffixes(state);
+
+        // Temp store directly — never SaveNemesisState (DB path).
+        ActiveTemporaryNemeses[creature->GetGUID()] = state;
+        ApplyNemesisState(creature, state);
+        creature->SetFullHealth();
+
+        // Addon: push to everyone already inside this instance; late joiners
+        // are covered by the map-enter hook.
+        Map::PlayerList const& players = map->GetPlayers();
+        for (auto itr = players.begin(); itr != players.end(); ++itr)
+            if (Player* player = itr->GetSource())
+                SendValidatedNemesisUpsert(player, creature->GetSpawnId(), state);
+
+        // "[Немезида]: {} затаился(ась) в этом подземелье (ранг N)!"
+        AnnounceToMap(map, Acore::StringFormat("[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: {} \u0437\u0430\u0442\u0430\u0438\u043b\u0441\u044f(\u0430\u0441\u044c) \u0432 \u044d\u0442\u043e\u043c \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435 (\u0440\u0430\u043d\u0433 {})!",
+            creature->GetName(), state.rank));
+    }
 }
 
 // Forward declaration for the bounty board completion check (full impl lives
@@ -2339,6 +2454,213 @@ namespace  // reopen anon ns
 namespace NemesisBountyBoard
 {
     bool CheckCompletion(Player* player, Creature* killed, std::string& outTitle, uint8& outRank);
+}
+
+// ============================================================================
+// Special daily tasks (особые поручения, 2026-06-07). One COMPLETION per day,
+// the day's task choice is final (abandon allowed, re-accept same type only).
+// Reward: 1x «Монета авантюриста» (110150). Types:
+//   SPEED     — kill any nemesis within SpeedKillMinutes of accepting
+//   CONTINENT — kill a non-gray nemesis on the opposite classic continent
+//               (EK <-> Kalimdor; accept only while on map 0/1)
+//   DUNGEON   — kill a (temporary) nemesis inside a dungeon, solo or group
+// ============================================================================
+namespace NemesisSpecialTask
+{
+    enum TaskType : uint8
+    {
+        TASK_NONE      = 0,
+        TASK_SPEED     = 1,
+        TASK_CONTINENT = 2,
+        TASK_DUNGEON   = 3,
+    };
+
+    struct TaskState
+    {
+        uint32 dayStart = 0;
+        uint8  type = TASK_NONE;
+        uint32 acceptedAt = 0;   // 0 while abandoned (type still locks the day)
+        uint32 param = 0;        // CONTINENT: target mapId (0 or 1)
+        bool   completed = false;
+        bool   loaded = false;
+    };
+
+    static std::unordered_map<uint32, TaskState> Cache;
+
+    bool IsEnabled()
+    {
+        return sConfigMgr->GetOption<bool>("NemesisSpecialTask.Enable", true);
+    }
+
+    uint32 GetSpeedLimitSeconds()
+    {
+        return std::max<uint32>(60, sConfigMgr->GetOption<uint32>("NemesisSpecialTask.SpeedKillMinutes", 30) * 60);
+    }
+
+    // Real calendar day aligned to the server's daily-quest reset.
+    uint32 GetDayStart()
+    {
+        uint32 const now = uint32(GameTime::GetGameTime().count());
+        uint32 const next = uint32(sWorld->GetNextDailyQuestsResetTime().count());
+        if (next > now && next - now <= DAY)
+            return next - DAY;
+        return (now / DAY) * DAY;  // fallback: UTC midnight
+    }
+
+    TaskState& Load(Player* player)
+    {
+        uint32 const guidLow = player->GetGUID().GetCounter();
+        TaskState& st = Cache[guidLow];
+        if (!st.loaded)
+        {
+            st.loaded = true;
+            if (QueryResult result = CharacterDatabase.Query(
+                "SELECT `day_start`, `task_type`, `accepted_at`, `param`, `completed` "
+                "FROM `character_nemesis_special_task` WHERE `guid` = {}", guidLow))
+            {
+                Field* f = result->Fetch();
+                st.dayStart   = f[0].Get<uint32>();
+                st.type       = f[1].Get<uint8>();
+                st.acceptedAt = f[2].Get<uint32>();
+                st.param      = f[3].Get<uint32>();
+                st.completed  = f[4].Get<uint8>() != 0;
+            }
+        }
+
+        // New day — the previous row is stale; start fresh.
+        if (st.dayStart != GetDayStart())
+        {
+            st = TaskState();
+            st.loaded = true;
+            st.dayStart = GetDayStart();
+        }
+        return st;
+    }
+
+    void Persist(Player* player, TaskState const& st)
+    {
+        CharacterDatabase.Execute(
+            "REPLACE INTO `character_nemesis_special_task` (`guid`, `day_start`, `task_type`, `accepted_at`, `param`, `completed`) "
+            "VALUES ({}, {}, {}, {}, {}, {})",
+            player->GetGUID().GetCounter(), st.dayStart, uint32(st.type), st.acceptedAt, st.param, st.completed ? 1 : 0);
+    }
+
+    void OnLogout(Player* player)
+    {
+        if (player)
+            Cache.erase(player->GetGUID().GetCounter());
+    }
+
+    char const* ContinentName(uint32 mapId)
+    {
+        // "в Восточных королевствах" / "в Калимдоре"
+        return mapId == 0
+            ? "\u0432 \u0412\u043e\u0441\u0442\u043e\u0447\u043d\u044b\u0445 \u043a\u043e\u0440\u043e\u043b\u0435\u0432\u0441\u0442\u0432\u0430\u0445"
+            : "\u0432 \u041a\u0430\u043b\u0438\u043c\u0434\u043e\u0440\u0435";
+    }
+
+    bool Accept(Player* player, uint8 type, std::string& err)
+    {
+        TaskState& st = Load(player);
+        if (st.completed)
+        {
+            err = "\u041f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u043d\u0430 \u0441\u0435\u0433\u043e\u0434\u043d\u044f \u0443\u0436\u0435 \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d\u043e.";
+            return false;
+        }
+        if (st.type != TASK_NONE && st.type != type)
+        {
+            err = "\u0421\u0435\u0433\u043e\u0434\u043d\u044f \u0442\u044b \u0443\u0436\u0435 \u0432\u044b\u0431\u0440\u0430\u043b \u0434\u0440\u0443\u0433\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435.";
+            return false;
+        }
+        if (st.type == type && st.acceptedAt)
+        {
+            err = "\u042d\u0442\u043e \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0443\u0436\u0435 \u0430\u043a\u0442\u0438\u0432\u043d\u043e.";
+            return false;
+        }
+
+        uint32 param = 0;
+        if (type == TASK_CONTINENT)
+        {
+            uint32 const mapId = player->GetMapId();
+            if (mapId != 0 && mapId != 1)
+            {
+                err = "\u042d\u0442\u043e \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u043c\u043e\u0436\u043d\u043e \u0432\u0437\u044f\u0442\u044c \u0442\u043e\u043b\u044c\u043a\u043e \u0432 \u0412\u043e\u0441\u0442\u043e\u0447\u043d\u044b\u0445 \u043a\u043e\u0440\u043e\u043b\u0435\u0432\u0441\u0442\u0432\u0430\u0445 \u0438\u043b\u0438 \u041a\u0430\u043b\u0438\u043c\u0434\u043e\u0440\u0435.";
+                return false;
+            }
+            param = mapId == 0 ? 1 : 0;
+        }
+
+        st.type = type;
+        st.acceptedAt = uint32(GameTime::GetGameTime().count());
+        st.param = param;
+        st.completed = false;
+        Persist(player, st);
+        return true;
+    }
+
+    void Abandon(Player* player)
+    {
+        TaskState& st = Load(player);
+        if (st.type == TASK_NONE || st.completed || !st.acceptedAt)
+            return;
+        st.acceptedAt = 0;  // day stays locked to this type
+        Persist(player, st);
+    }
+
+    // Called per reward recipient when a nemesis (persistent or temporary)
+    // dies. Group members each check their own task.
+    void OnNemesisKilled(Player* player, Creature* killed)
+    {
+        if (!IsEnabled() || !player || !killed)
+            return;
+
+        TaskState& st = Load(player);
+        if (st.type == TASK_NONE || st.completed || !st.acceptedAt)
+            return;
+
+        uint32 const now = uint32(GameTime::GetGameTime().count());
+        bool ok = false;
+        switch (st.type)
+        {
+            case TASK_SPEED:
+                if (now - st.acceptedAt <= GetSpeedLimitSeconds())
+                    ok = true;
+                else
+                {
+                    // Timer ran out — drop to abandoned so the player can
+                    // re-accept the same task for a fresh timer.
+                    st.acceptedAt = 0;
+                    Persist(player, st);
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        // "[Немезида]: Время вышло. Возьми поручение у трактирщика заново."
+                        "[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: \u0412\u0440\u0435\u043c\u044f \u0432\u044b\u0448\u043b\u043e. \u0412\u043e\u0437\u044c\u043c\u0438 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0443 \u0442\u0440\u0430\u043a\u0442\u0438\u0440\u0449\u0438\u043a\u0430 \u0437\u0430\u043d\u043e\u0432\u043e.");
+                }
+                break;
+            case TASK_CONTINENT:
+                ok = killed->GetMapId() == st.param
+                    && killed->GetLevel() > Acore::XP::GetGrayLevel(player->GetLevel());
+                break;
+            case TASK_DUNGEON:
+                ok = killed->GetMap() && killed->GetMap()->IsDungeon();
+                break;
+            default:
+                break;
+        }
+
+        if (!ok)
+            return;
+
+        st.completed = true;
+        Persist(player, st);
+
+        uint32 const rewardItem = sConfigMgr->GetOption<uint32>("NemesisSpecialTask.RewardItem", 110150);
+        uint32 const rewardCount = sConfigMgr->GetOption<uint32>("NemesisSpecialTask.RewardCount", 1);
+        AddItemOrMail(player, rewardItem, rewardCount);
+
+        ChatHandler(player->GetSession()).PSendSysMessage(
+            // "[Немезида]: Особое поручение выполнено! Награда: Монета авантюриста."
+            "[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: \u041e\u0441\u043e\u0431\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d\u043e! \u041d\u0430\u0433\u0440\u0430\u0434\u0430: \u041c\u043e\u043d\u0435\u0442\u0430 \u0430\u0432\u0430\u043d\u0442\u044e\u0440\u0438\u0441\u0442\u0430.");
+    }
 }
 
 class NemesisSystemPlayerScript : public PlayerScript
@@ -2377,6 +2699,7 @@ public:
     void OnPlayerLogout(Player* player) override
     {
         NemesisReputation::OnLogout(player);
+        NemesisSpecialTask::OnLogout(player);
         // Drop cached bounty pools for this player — they're cheap to
         // regenerate on next login and otherwise grow unboundedly across
         // logins over long server uptime.
@@ -2446,6 +2769,11 @@ public:
                     bonusFlat + bonusPerRank * uint32(bountyRank));
             }
         }
+
+        // Special daily task — each recipient checks their own active task
+        // (covers group credit: "в группе или без").
+        for (Player* recipient : recipients.players)
+            NemesisSpecialTask::OnNemesisKilled(recipient, killed);
 
         if (ShouldAnnounceKill() && state.rank >= GetAnnounceMinRank())
         {
@@ -2563,7 +2891,12 @@ public:
         }
 
         if (!found)
+        {
+            // Fresh spawn with no state — in dungeon maps this is where a
+            // creature may roll into a temporary dungeon nemesis.
+            TryRollDungeonNemesis(creature);
             return;
+        }
 
         ApplyNemesisState(creature, state);
 
@@ -2595,6 +2928,8 @@ public:
                 }
             }
         }
+        else if (ActiveTemporaryNemeses.count(creature->GetGUID()))
+            ActiveTemporaryNemeses[creature->GetGUID()] = state;  // temp-resident (dungeon) — never to the persistent store
         else if (ObjectGuid::LowType const spawnId = creature->GetSpawnId())
             ActiveNemeses[spawnId] = state;
         else if (IsTemporaryNemesisCandidate(creature))
@@ -2618,9 +2953,8 @@ public:
             return;
         }
 
-        if (creature->GetSpawnId())
-            return;
-
+        // Always erase guid-keyed temp entries — dungeon nemeses carry
+        // spawnIds but live in the temporary store only.
         ActiveTemporaryNemeses.erase(creature->GetGUID());
         TemporaryRegenTickAccumulators.erase(creature->GetGUID());
     }
@@ -4074,6 +4408,12 @@ class NemesisBountyVendorScript : public AllCreatureScript
     static constexpr uint32 SHOP_STATBOOST_ACTION      = GOSSIP_ACTION_INFO_DEF + 9006;
     static constexpr uint32 SHOP_FAMILIAR_ACTION       = GOSSIP_ACTION_INFO_DEF + 9007;
     static constexpr uint32 SHOP_BACK_ACTION           = GOSSIP_ACTION_INFO_DEF + 9008;
+    // Special daily task (особое поручение). Accept actions are
+    // TASK_MENU_ACTION + TaskType (1=speed, 2=continent, 3=dungeon).
+    static constexpr uint32 TASK_MENU_ACTION           = GOSSIP_ACTION_INFO_DEF + 9010;
+    static constexpr uint32 TASK_ACCEPT_FIRST          = GOSSIP_ACTION_INFO_DEF + 9011;
+    static constexpr uint32 TASK_ACCEPT_LAST           = GOSSIP_ACTION_INFO_DEF + 9013;
+    static constexpr uint32 TASK_ABANDON_ACTION        = GOSSIP_ACTION_INFO_DEF + 9014;
     // Slot-indexed ranges (room for 100 slots; SlotsPerDay default is 3).
     static constexpr uint32 BOARD_DETAIL_BASE_ACTION   = GOSSIP_ACTION_INFO_DEF + 9100;  // +slot
     static constexpr uint32 BOARD_ACCEPT_BASE_ACTION   = GOSSIP_ACTION_INFO_DEF + 9300;  // +slot
@@ -4125,6 +4465,12 @@ public:
                 "\u0414\u043e\u0441\u043a\u0430 \u043e\u0431\u044a\u044f\u0432\u043b\u0435\u043d\u0438\u0439 \u043e\u0445\u043e\u0442\u043d\u0438\u043a\u0430 \u0437\u0430 \u0433\u043e\u043b\u043e\u0432\u0430\u043c\u0438",  // Доска объявлений охотника за головами
                 GOSSIP_SENDER_MAIN, BOARD_GOSSIP_ACTION);
 
+        // ── Special daily task ──
+        if (NemesisSpecialTask::IsEnabled())
+            AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1,
+                "\u041e\u0441\u043e\u0431\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435",
+                GOSSIP_SENDER_MAIN, TASK_MENU_ACTION);
+
         player->TalkedToCreature(creature->GetEntry(), creature->GetGUID());
         SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
         return true;
@@ -4173,6 +4519,31 @@ public:
         // ── Shop submenu: back to the innkeeper root menu ──
         if (action == SHOP_BACK_ACTION)
             return CanCreatureGossipHello(player, creature);
+
+        // ── Special daily task menu ──
+        if (action == TASK_MENU_ACTION)
+        {
+            ShowSpecialTask(player, creature);
+            return true;
+        }
+
+        if (action >= TASK_ACCEPT_FIRST && action <= TASK_ACCEPT_LAST)
+        {
+            uint8 const type = uint8(action - TASK_MENU_ACTION);  // 1..3 == TaskType
+            std::string err;
+            if (!NemesisSpecialTask::Accept(player, type, err))
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: {}", err);
+            ShowSpecialTask(player, creature);
+            return true;
+        }
+
+        if (action == TASK_ABANDON_ACTION)
+        {
+            NemesisSpecialTask::Abandon(player);
+            ShowSpecialTask(player, creature);
+            return true;
+        }
 
         // ── Shop submenu: general goods (rank 1, no gate) ──
         if (action == SHOP_GENERAL_ACTION)
@@ -4396,6 +4767,83 @@ private:
             GOSSIP_SENDER_MAIN, SHOP_BACK_ACTION);
 
         SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
+    }
+
+    // Special daily task view: header text describes the current state, the
+    // menu offers accept/abandon. The day's task choice is final - after an
+    // abandon only the SAME type can be re-accepted (fresh timer for SPEED).
+    void ShowSpecialTask(Player* player, Creature* creature)
+    {
+        ClearGossipMenuFor(player);
+
+        NemesisSpecialTask::TaskState const& st = NemesisSpecialTask::Load(player);
+        uint32 const now = uint32(GameTime::GetGameTime().count());
+
+        std::string header;
+        if (st.completed)
+        {
+            header = "\u041f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u043d\u0430 \u0441\u0435\u0433\u043e\u0434\u043d\u044f \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d\u043e. \u0412\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0439\u0441\u044f \u0437\u0430\u0432\u0442\u0440\u0430.";
+        }
+        else if (st.type != NemesisSpecialTask::TASK_NONE && st.acceptedAt)
+        {
+            switch (st.type)
+            {
+                case NemesisSpecialTask::TASK_SPEED:
+                {
+                    uint32 const limit = NemesisSpecialTask::GetSpeedLimitSeconds();
+                    uint32 const elapsed = now - st.acceptedAt;
+                    uint32 const leftMin = elapsed >= limit ? 0 : (limit - elapsed + 59) / 60;
+                    header = Acore::StringFormat("\u0423\u0431\u0435\u0439 \u043b\u044e\u0431\u0443\u044e \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0443. \u041e\u0441\u0442\u0430\u043b\u043e\u0441\u044c \u043c\u0438\u043d\u0443\u0442: {}.", leftMin);
+                    break;
+                }
+                case NemesisSpecialTask::TASK_CONTINENT:
+                    header = Acore::StringFormat("\u0423\u0431\u0435\u0439 \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0443 {}. \u0421\u0435\u0440\u044b\u0435 \u0446\u0435\u043b\u0438 \u043d\u0435 \u0441\u0447\u0438\u0442\u0430\u044e\u0442\u0441\u044f.", NemesisSpecialTask::ContinentName(st.param));
+                    break;
+                case NemesisSpecialTask::TASK_DUNGEON:
+                    header = "\u0421\u0440\u0430\u0437\u0438 \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0443 \u0432 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435. \u041e\u043d\u0438 \u0442\u0430\u044f\u0442\u0441\u044f \u0441\u0440\u0435\u0434\u0438 \u043e\u0431\u044b\u0447\u043d\u044b\u0445 \u0432\u0440\u0430\u0433\u043e\u0432.";
+                    break;
+                default:
+                    break;
+            }
+        }
+        else if (st.type != NemesisSpecialTask::TASK_NONE)
+        {
+            header = "\u0422\u044b \u043e\u0442\u043a\u0430\u0437\u0430\u043b\u0441\u044f \u043e\u0442 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u044f, \u043d\u043e \u043c\u043e\u0436\u0435\u0448\u044c \u0432\u0437\u044f\u0442\u044c \u0435\u0433\u043e \u0441\u043d\u043e\u0432\u0430.";
+        }
+        else
+        {
+            header = "\u041e\u0434\u043d\u043e \u043e\u0441\u043e\u0431\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0432 \u0434\u0435\u043d\u044c. \u041d\u0430\u0433\u0440\u0430\u0434\u0430: \u043c\u043e\u043d\u0435\u0442\u0430 \u0430\u0432\u0430\u043d\u0442\u044e\u0440\u0438\u0441\u0442\u0430.";
+        }
+
+        if (!st.completed && !st.acceptedAt)
+        {
+            bool const locked = st.type != NemesisSpecialTask::TASK_NONE;
+            if (!locked || st.type == NemesisSpecialTask::TASK_SPEED)
+                AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
+                    "\u041f\u0440\u0438\u043d\u044f\u0442\u044c: \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0430 \u043d\u0430 \u0441\u043a\u043e\u0440\u043e\u0441\u0442\u044c",
+                    GOSSIP_SENDER_MAIN, TASK_MENU_ACTION + NemesisSpecialTask::TASK_SPEED);
+            if (!locked || st.type == NemesisSpecialTask::TASK_CONTINENT)
+                AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
+                    "\u041f\u0440\u0438\u043d\u044f\u0442\u044c: \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0430 \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u043c \u043a\u043e\u043d\u0442\u0438\u043d\u0435\u043d\u0442\u0435",
+                    GOSSIP_SENDER_MAIN, TASK_MENU_ACTION + NemesisSpecialTask::TASK_CONTINENT);
+            if (!locked || st.type == NemesisSpecialTask::TASK_DUNGEON)
+                AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
+                    "\u041f\u0440\u0438\u043d\u044f\u0442\u044c: \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0430 \u0432 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435",
+                    GOSSIP_SENDER_MAIN, TASK_MENU_ACTION + NemesisSpecialTask::TASK_DUNGEON);
+        }
+
+        if (!st.completed && st.type != NemesisSpecialTask::TASK_NONE && st.acceptedAt)
+            AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
+                "\u041e\u0442\u043a\u0430\u0437\u0430\u0442\u044c\u0441\u044f",
+                GOSSIP_SENDER_MAIN, TASK_ABANDON_ACTION);
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+            "\u041d\u0430\u0437\u0430\u0434",
+            GOSSIP_SENDER_MAIN, SHOP_BACK_ACTION);
+
+        uint32 const customTextId = 0x7E000000u | (player->GetGUID().GetCounter() & 0x00FFFFFFu);
+        SendCustomNpcText(player, header, customTextId);
+        SendGossipMenuFor(player, customTextId, creature->GetGUID());
     }
 
     // Main board view. If the player has an active contract, hides the pool
@@ -4708,6 +5156,37 @@ private:
     uint32 _nextTickMs = 0;
 };
 
+// ============================================================================
+// Dungeon map hook: push this instance's temporary nemeses to the addon of a
+// player entering the dungeon (creation-time pushes only reach players who
+// were already inside).
+// ============================================================================
+class NemesisDungeonMapScript : public AllMapScript
+{
+public:
+    NemesisDungeonMapScript() : AllMapScript("NemesisDungeonMapScript", { ALLMAPHOOK_ON_PLAYER_ENTER_ALL }) { }
+
+    void OnPlayerEnterAll(Map* map, Player* player) override
+    {
+        if (!map || !player || !map->IsDungeon())
+            return;
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
+            return;
+
+        for (auto const& [guid, state] : ActiveTemporaryNemeses)
+        {
+            if (state.mapId != map->GetId())
+                continue;
+            // ObjectAccessor resolves only creatures in the PLAYER's own
+            // instance - other instances of the same dungeon are filtered.
+            Creature* creature = ObjectAccessor::GetCreature(*player, guid);
+            if (!creature || !creature->IsAlive())
+                continue;
+            SendValidatedNemesisUpsert(player, creature->GetSpawnId(), state);
+        }
+    }
+};
+
 void AddSC_mod_nemesis_system()
 {
     new NemesisSystemPlayerScript();
@@ -4716,4 +5195,5 @@ void AddSC_mod_nemesis_system()
     new NemesisSystemCommandScript();
     new NemesisBountyVendorScript();
     new NemesisAmbientWorldScript();
+    new NemesisDungeonMapScript();
 }

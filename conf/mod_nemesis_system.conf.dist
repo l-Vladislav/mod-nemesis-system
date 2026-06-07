@@ -529,6 +529,78 @@ NemesisSystem.AmbientGeneration.Announce = 1
 
 NemesisSystem.AmbientGeneration.AnnounceZoneOnly = 1
 
+########################################
+# DUNGEON NEMESES
+########################################
+
+#
+#    NemesisSystem.DungeonNemesis.Enable
+#        Description: Creatures spawning in dungeon maps roll a chance to
+#                     become a TEMPORARY nemesis (weighted random rank
+#                     50/30/15/4/1, trash and elites only, bosses excluded).
+#                     Per-instance, never persisted, dies with the instance.
+#        Default:     1
+#
+
+NemesisSystem.DungeonNemesis.Enable = 1
+
+#
+#    NemesisSystem.DungeonNemesis.Chance
+#        Description: Percent chance per eligible creature spawn.
+#        Default:     3.0
+#
+
+NemesisSystem.DungeonNemesis.Chance = 3.0
+
+#
+#    NemesisSystem.DungeonNemesis.IncludeRaids
+#        Description: Also roll in raid maps.
+#        Default:     0
+#
+
+NemesisSystem.DungeonNemesis.IncludeRaids = 0
+
+#
+#    NemesisSystem.DungeonNemesis.RequireRealPlayers
+#        Description: Only roll when the instance holds at least one real
+#                     player (playerbot-only runs excluded).
+#        Default:     1
+#
+
+NemesisSystem.DungeonNemesis.RequireRealPlayers = 1
+
+########################################
+# SPECIAL DAILY TASKS (особые поручения)
+########################################
+
+#
+#    NemesisSpecialTask.Enable
+#        Description: Innkeeper gossip "Особое поручение" — one completion per
+#                     day, day's choice is final. Types: speed kill / opposite
+#                     classic continent / dungeon nemesis.
+#        Default:     1
+#
+
+NemesisSpecialTask.Enable = 1
+
+#
+#    NemesisSpecialTask.SpeedKillMinutes
+#        Description: Time limit for the speed-kill task.
+#        Default:     30
+#
+
+NemesisSpecialTask.SpeedKillMinutes = 30
+
+#
+#    NemesisSpecialTask.RewardItem
+#    NemesisSpecialTask.RewardCount
+#        Description: Completion reward (default: 1x Монета авантюриста).
+#        Default:     110150 / 1
+#
+
+NemesisSpecialTask.RewardItem = 110150
+NemesisSpecialTask.RewardCount = 1
+
 ###############################################################################
 # BOUNTY BOARD SETTINGS
 #
