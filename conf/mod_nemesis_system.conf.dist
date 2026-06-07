@@ -387,12 +387,70 @@ NemesisSystem.BountyVendor.Enable = 1
 
 #
 #    NemesisSystem.BountyVendor.Entry
-#        Description: The npc_vendor entry used for the bounty vendor inventory.
+#        Description: The npc_vendor entry used for the LEGACY flat bounty
+#                     vendor inventory (used only when RankMenus is disabled).
 #                     All innkeepers share this vendor entry.
 #        Default:     190000
 #
 
 NemesisSystem.BountyVendor.Entry = 190000
+
+#
+#    NemesisSystem.BountyVendor.RankMenus.Enable
+#        Description: Replace the flat vendor with rank-gated gossip submenus:
+#                     "Общие товары" (rank 1), "Печати и нашивки" (StatBooster,
+#                     rank 2), "Сумки с фамильярами" (familiar gacha, rank 3).
+#                     Locked submenus stay visible with a rank-requirement note.
+#        Default:     1 - Enabled
+#                     0 - Disabled (legacy flat vendor via .Entry)
+#
+
+NemesisSystem.BountyVendor.RankMenus.Enable = 1
+
+#
+#    NemesisSystem.BountyVendor.GeneralEntry
+#        Description: npc_vendor entry for the "Общие товары" submenu (rank 1+):
+#                     universal gacha bag, Attribute Recalibrator, T1 consumables.
+#        Default:     190100
+#
+
+NemesisSystem.BountyVendor.GeneralEntry = 190100
+
+#
+#    NemesisSystem.BountyVendor.StatBoosterEntry
+#        Description: npc_vendor entry for the "Печати и нашивки" submenu:
+#                     all StatBooster consumables (T1-T4).
+#        Default:     190101
+#
+
+NemesisSystem.BountyVendor.StatBoosterEntry = 190101
+
+#
+#    NemesisSystem.BountyVendor.FamiliarEntry
+#        Description: npc_vendor entry for the "Сумки с фамильярами" submenu:
+#                     the 10 element gacha bags (5 adventurer coins each).
+#        Default:     190102
+#
+
+NemesisSystem.BountyVendor.FamiliarEntry = 190102
+
+#
+#    NemesisSystem.BountyVendor.StatBoosterRank
+#        Description: Minimum Hunter's Covenant reputation rank (1-5) required
+#                     to open the StatBooster submenu.
+#        Default:     2 (Охотник)
+#
+
+NemesisSystem.BountyVendor.StatBoosterRank = 2
+
+#
+#    NemesisSystem.BountyVendor.FamiliarRank
+#        Description: Minimum Hunter's Covenant reputation rank (1-5) required
+#                     to open the familiar bags submenu.
+#        Default:     3 (Следопыт)
+#
+
+NemesisSystem.BountyVendor.FamiliarRank = 3
 
 ###############################################################################
 # BOUNTY BOARD SETTINGS

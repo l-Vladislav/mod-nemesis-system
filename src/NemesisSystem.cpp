@@ -14,13 +14,16 @@
 #include "GuildMgr.h"
 #include "Map.h"
 #include "MapMgr.h"
+#include "ObjectAccessor.h"
 #include "ObjectGuid.h"
 #include "ObjectMgr.h"
+#include "TemporarySummon.h"
 #include "Mail.h"
 #include "Player.h"
 #include "Random.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
+#include "SpellMgr.h"
 #include "UnitScript.h"
 #include "WorldPacket.h"
 #include "World.h"
@@ -2064,6 +2067,29 @@ public:
     void OnPlayerLogin(Player* player) override
     {
         NemesisReputation::OnLogin(player);
+
+        // Strip orphan familiar auras left over from a previous session.
+        //
+        // Why this is needed: familiar owner-auras are permanent + flagged
+        // NO_AURA_CANCEL, so they survive player save. On logout the pet
+        // despawns and `OnCreatureRemoveWorld` removes the aura in-memory,
+        // but `Player::SaveToDB()` runs earlier in the logout sequence and
+        // persists the still-active aura into `character_aura`. On next
+        // login `Player::LoadFromDB()` re-applies it — but companions do
+        // NOT auto-summon on login, so the aura ends up active with no
+        // pet to back it.
+        //
+        // Stripping all familiar auras on login is safe: if the player
+        // re-summons their pet, `OnCreatureAddWorld` re-applies both buff
+        // and debuff via the standard path.
+        for (uint32 spellId = 103000; spellId <= 103099; ++spellId)
+            player->RemoveAurasDueToSpell(spellId);
+        for (uint32 spellId = 104000; spellId <= 104099; ++spellId)
+            player->RemoveAurasDueToSpell(spellId);
+        // T1 fallback range (190010-012 pets) — drop when T1 migration lands.
+        player->RemoveAurasDueToSpell(101100);
+        player->RemoveAurasDueToSpell(101101);
+        player->RemoveAurasDueToSpell(101102);
     }
 
     void OnPlayerLogout(Player* player) override
@@ -2156,6 +2182,65 @@ public:
     }
 };
 
+// Familiar entry → owner-aura spell mapping.
+// Gacha pool (10 families × 10 pets = 100 entries) lives at 191000-191099.
+// Linear formula resolves each pet to:
+//   buff aura   = 103000 + (entry - 191000)   (positive-only effects)
+//   debuff aura = 104000 + (entry - 191000)   (negative-only effects)
+// Both auras are applied on summon, removed on dismiss. The split keeps the
+// buff on the buff bar and the debuff on the debuff bar — a mixed row would
+// render as a single buff-bar icon with both lines in the tooltip, because
+// client 3.3.5a classifies the spell as positive/negative as a whole.
+// Auras are kept out of the summon spell itself because Effect_2 APPLY_AURA
+// breaks companion-menu classification (implementation log bug #8).
+// Cast site guards 104xxx with sSpellMgr lookup so pets without a debuff
+// row (clean Commons, Rares) generate no log spam.
+// T1 pets (190010-012) retained as fallback while Phase 3 migration is in
+// flight; once T1 creature_template rows are dropped they become dead code.
+struct FamiliarAuras
+{
+    uint32 buff = 0;
+    uint32 debuff = 0;
+};
+
+static FamiliarAuras GetFamiliarOwnerAuraSpells(uint32 entry)
+{
+    if (entry >= 191000 && entry <= 191099)
+    {
+        uint32 const offset = entry - 191000;
+        FamiliarAuras out;
+        out.buff   = 103000 + offset;
+        out.debuff = 104000 + offset; // optional; cast site checks sSpellMgr
+        return out;
+    }
+
+    FamiliarAuras t1;
+    switch (entry)
+    {
+        case 190010: t1.buff = 101100; return t1; // Guardian Wolf Cub → +1% armor
+        case 190011: t1.buff = 101101; return t1; // Falcon Chick → +1% melee crit
+        case 190012: t1.buff = 101102; return t1; // Raven Fledgling → +1% spell crit
+    }
+    return {};
+}
+
+// Resolves the player to apply/remove aura on. Minipets use TempSummon +
+// summoner GUID; GetOwner() is usually null for SPELL_EFFECT_SUMMON with
+// MINIPET properties. Resolve via the summoner guid and fall back to
+// GetOwner for safety.
+static Player* GetFamiliarOwnerPlayer(Creature* creature)
+{
+    if (!creature)
+        return nullptr;
+    if (TempSummon* temp = creature->ToTempSummon())
+        if (Unit* s = temp->GetSummonerUnit())
+            if (Player* player = s->ToPlayer())
+                return player;
+    if (Unit* owner = creature->GetOwner())
+        return owner->ToPlayer();
+    return nullptr;
+}
+
 class NemesisSystemAllCreatureScript : public AllCreatureScript
 {
 public:
@@ -2163,6 +2248,18 @@ public:
 
     void OnCreatureAddWorld(Creature* creature) override
     {
+        FamiliarAuras const auras = GetFamiliarOwnerAuraSpells(creature->GetEntry());
+        if (auras.buff)
+        {
+            if (Player* player = GetFamiliarOwnerPlayer(creature))
+            {
+                player->CastSpell(player, auras.buff, true);
+                if (auras.debuff && sSpellMgr->GetSpellInfo(auras.debuff))
+                    player->CastSpell(player, auras.debuff, true);
+            }
+            return;
+        }
+
         NemesisState state;
         bool found = TryGetNemesisState(creature, state);
 
@@ -2224,7 +2321,22 @@ public:
 
     void OnCreatureRemoveWorld(Creature* creature) override
     {
-        if (!creature || creature->GetSpawnId())
+        if (!creature)
+            return;
+
+        FamiliarAuras const auras = GetFamiliarOwnerAuraSpells(creature->GetEntry());
+        if (auras.buff)
+        {
+            if (Player* player = GetFamiliarOwnerPlayer(creature))
+            {
+                player->RemoveAurasDueToSpell(auras.buff);
+                if (auras.debuff)
+                    player->RemoveAurasDueToSpell(auras.debuff);
+            }
+            return;
+        }
+
+        if (creature->GetSpawnId())
             return;
 
         ActiveTemporaryNemeses.erase(creature->GetGUID());
@@ -2376,7 +2488,7 @@ public:
         return true;
     }
 
-    static bool HandleAddonReport(ChatHandler* handler, uint64 rawSpawnId)
+    static bool HandleAddonReport(ChatHandler* handler, uint64 rawSpawnId, Optional<uint32> entryArg)
     {
         Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
         if (!player)
@@ -2390,15 +2502,28 @@ public:
         if (!TryGetNemesisState(spawnId, state))
             return true;
 
+        // Verify the player's selected target actually IS the nemesis being
+        // reported. Without this check, a buggy or malicious client could
+        // overwrite the row with the player's location for any spawn_id
+        // (the original cause of corrupted Thunder Bluff coordinates on
+        // Stranglethorn-resident nemeses — see addon parseCreatureGuid).
+        Unit* targetUnit = ObjectAccessor::GetUnit(*player, player->GetTarget());
+        Creature* creature = targetUnit ? targetUnit->ToCreature() : nullptr;
+        if (!creature || creature->GetSpawnId() != spawnId)
+            return true;
+
+        if (entryArg && *entryArg != 0 && creature->GetEntry() != *entryArg)
+            return true;
+
         uint32 const now = uint32(GameTime::GetGameTime().count());
         if (state.lastSeenAt && state.lastSeenAt + GetAddonReportCooldownSeconds() > now)
             return true;
 
-        state.mapId = player->GetMapId();
-        state.zoneId = player->GetZoneId();
-        state.homeX = player->GetPositionX();
-        state.homeY = player->GetPositionY();
-        state.homeZ = player->GetPositionZ();
+        state.mapId = creature->GetMapId();
+        state.zoneId = creature->GetZoneId();
+        state.homeX = creature->GetPositionX();
+        state.homeY = creature->GetPositionY();
+        state.homeZ = creature->GetPositionZ();
         state.lastSeenAt = now;
 
         ActiveNemeses[spawnId] = state;
@@ -3650,6 +3775,12 @@ class NemesisBountyVendorScript : public AllCreatureScript
     static constexpr uint32 BOARD_BACK_ACTION          = GOSSIP_ACTION_INFO_DEF + 9002;
     static constexpr uint32 BOARD_ACTIVE_VIEW_ACTION   = GOSSIP_ACTION_INFO_DEF + 9003;
     static constexpr uint32 BOARD_ABANDON_ACTION       = GOSSIP_ACTION_INFO_DEF + 9004;
+    // Rank-gated shop submenus (2026-06-07): rank 1 general goods, rank 2
+    // StatBooster consumables, rank 3 familiar gacha bags.
+    static constexpr uint32 SHOP_GENERAL_ACTION        = GOSSIP_ACTION_INFO_DEF + 9005;
+    static constexpr uint32 SHOP_STATBOOST_ACTION      = GOSSIP_ACTION_INFO_DEF + 9006;
+    static constexpr uint32 SHOP_FAMILIAR_ACTION       = GOSSIP_ACTION_INFO_DEF + 9007;
+    static constexpr uint32 SHOP_BACK_ACTION           = GOSSIP_ACTION_INFO_DEF + 9008;
     // Slot-indexed ranges (room for 100 slots; SlotsPerDay default is 3).
     static constexpr uint32 BOARD_DETAIL_BASE_ACTION   = GOSSIP_ACTION_INFO_DEF + 9100;  // +slot
     static constexpr uint32 BOARD_ACCEPT_BASE_ACTION   = GOSSIP_ACTION_INFO_DEF + 9300;  // +slot
@@ -3731,22 +3862,53 @@ public:
             return true;
         }
 
-        // ── Bounty vendor ──
+        // ── Bounty vendor: rank-gated shop submenu ──
         if (action == BOUNTY_GOSSIP_ACTION)
         {
-            uint32 vendorEntry = sConfigMgr->GetOption<uint32>(
-                "NemesisSystem.BountyVendor.Entry", 190000);
+            if (sConfigMgr->GetOption<bool>("NemesisSystem.BountyVendor.RankMenus.Enable", true))
+            {
+                ShowShopMenu(player, creature);
+                return true;
+            }
 
-            // Temporarily grant vendor flag so SendListInventory succeeds
-            bool hadVendorFlag = creature->HasNpcFlag(UNIT_NPC_FLAG_VENDOR);
-            if (!hadVendorFlag)
-                creature->SetNpcFlag(UNIT_NPC_FLAG_VENDOR);
+            // Legacy flat vendor (RankMenus disabled)
+            OpenVendor(player, creature, sConfigMgr->GetOption<uint32>(
+                "NemesisSystem.BountyVendor.Entry", 190000));
+            return true;
+        }
 
-            player->GetSession()->SendListInventory(creature->GetGUID(), vendorEntry);
+        // ── Shop submenu: back to the innkeeper root menu ──
+        if (action == SHOP_BACK_ACTION)
+            return CanCreatureGossipHello(player, creature);
 
-            if (!hadVendorFlag)
-                creature->RemoveNpcFlag(UNIT_NPC_FLAG_VENDOR);
+        // ── Shop submenu: general goods (rank 1, no gate) ──
+        if (action == SHOP_GENERAL_ACTION)
+        {
+            OpenVendor(player, creature, sConfigMgr->GetOption<uint32>(
+                "NemesisSystem.BountyVendor.GeneralEntry", 190100));
+            return true;
+        }
 
+        // ── Shop submenu: StatBooster consumables / familiar bags (gated) ──
+        if (action == SHOP_STATBOOST_ACTION || action == SHOP_FAMILIAR_ACTION)
+        {
+            bool const familiar = (action == SHOP_FAMILIAR_ACTION);
+            uint8 const need = ShopRankRequired(familiar);
+            if (NemesisReputation::GetRank(player) < need)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    // "[Немезида]: Эти товары доступны с ранга «{}»."
+                    "[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: "
+                    "\u042d\u0442\u0438 \u0442\u043e\u0432\u0430\u0440\u044b \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b "
+                    "\u0441 \u0440\u0430\u043d\u0433\u0430 \u00ab{}\u00bb.",
+                    NemesisReputation::GetRankName(need));
+                ShowShopMenu(player, creature);
+                return true;
+            }
+
+            OpenVendor(player, creature, familiar
+                ? sConfigMgr->GetOption<uint32>("NemesisSystem.BountyVendor.FamiliarEntry", 190102)
+                : sConfigMgr->GetOption<uint32>("NemesisSystem.BountyVendor.StatBoosterEntry", 190101));
             return true;
         }
 
@@ -3876,6 +4038,73 @@ public:
     }
 
 private:
+    // Required reputation rank for the gated shop submenus (config-tunable).
+    static uint8 ShopRankRequired(bool familiar)
+    {
+        return uint8(familiar
+            ? sConfigMgr->GetOption<uint32>("NemesisSystem.BountyVendor.FamiliarRank", 3)
+            : sConfigMgr->GetOption<uint32>("NemesisSystem.BountyVendor.StatBoosterRank", 2));
+    }
+
+    // Show a vendor list by virtual npc_vendor entry. Temporarily grants the
+    // vendor flag so SendListInventory succeeds on non-vendor innkeepers.
+    static void OpenVendor(Player* player, Creature* creature, uint32 vendorEntry)
+    {
+        bool const hadVendorFlag = creature->HasNpcFlag(UNIT_NPC_FLAG_VENDOR);
+        if (!hadVendorFlag)
+            creature->SetNpcFlag(UNIT_NPC_FLAG_VENDOR);
+
+        player->GetSession()->SendListInventory(creature->GetGUID(), vendorEntry);
+
+        if (!hadVendorFlag)
+            creature->RemoveNpcFlag(UNIT_NPC_FLAG_VENDOR);
+    }
+
+    // Rank-gated shop submenu: «Общие товары» (rank 1) / «Печати и нашивки»
+    // (StatBooster, rank 2) / «Сумки с фамильярами» (rank 3). Locked entries
+    // stay visible with a "(требуется ранг: …)" suffix so players see the
+    // progression; clicking one reports the missing rank.
+    void ShowShopMenu(Player* player, Creature* creature)
+    {
+        ClearGossipMenuFor(player);
+
+        uint8 const rank = NemesisReputation::GetRank(player);
+
+        // "Общие товары"
+        AddGossipItemFor(player, GOSSIP_ICON_VENDOR,
+            "\u041e\u0431\u0449\u0438\u0435 \u0442\u043e\u0432\u0430\u0440\u044b",
+            GOSSIP_SENDER_MAIN, SHOP_GENERAL_ACTION);
+
+        // "Печати и нашивки" (StatBooster)
+        {
+            std::string label = "\u041f\u0435\u0447\u0430\u0442\u0438 \u0438 \u043d\u0430\u0448\u0438\u0432\u043a\u0438";
+            if (uint8 const need = ShopRankRequired(false); rank < need)
+                label += Acore::StringFormat(
+                    " (\u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044f \u0440\u0430\u043d\u0433: {})",
+                    NemesisReputation::GetRankName(need));
+            AddGossipItemFor(player, GOSSIP_ICON_VENDOR, label,
+                GOSSIP_SENDER_MAIN, SHOP_STATBOOST_ACTION);
+        }
+
+        // "Сумки с фамильярами"
+        {
+            std::string label = "\u0421\u0443\u043c\u043a\u0438 \u0441 \u0444\u0430\u043c\u0438\u043b\u044c\u044f\u0440\u0430\u043c\u0438";
+            if (uint8 const need = ShopRankRequired(true); rank < need)
+                label += Acore::StringFormat(
+                    " (\u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044f \u0440\u0430\u043d\u0433: {})",
+                    NemesisReputation::GetRankName(need));
+            AddGossipItemFor(player, GOSSIP_ICON_VENDOR, label,
+                GOSSIP_SENDER_MAIN, SHOP_FAMILIAR_ACTION);
+        }
+
+        // "Назад"
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+            "\u041d\u0430\u0437\u0430\u0434",
+            GOSSIP_SENDER_MAIN, SHOP_BACK_ACTION);
+
+        SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
+    }
+
     // Main board view. If the player has an active contract, hides the pool
     // and shows only the active bounty — the innkeeper refuses new work
     // until the current contract is resolved.
