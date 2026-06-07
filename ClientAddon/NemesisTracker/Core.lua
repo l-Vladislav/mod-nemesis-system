@@ -117,21 +117,36 @@ local function zoneKey(zoneId, zoneName)
     return string.format("%s:%s", tostring(zoneId or 0), zoneName or "")
 end
 
-local function parseSpawnIdFromGuid(guid)
+-- Parse a creature GUID into (spawnId, entry).
+-- 3.3.5a HighGuid layout (see ObjectGuid.h ObjectGuid(hi, entry, counter)):
+--   _guid = counter | (entry << 24) | (hi << 48)
+-- As a 16-hex string: chars 1-4 = highGuid, 5-10 = entry, 11-16 = counter.
+-- Only HighGuid::Unit (0xF130) carries a creature spawn_id in its counter.
+-- Players (no high-guid prefix) and pets/vehicles (0xF140/F150) MUST NOT be
+-- treated as creature sightings, otherwise their lowGuid collides with real
+-- nemesis spawn_ids (e.g. a playerbot whose characters.guid equals a known
+-- nemesis spawn_id triggers a false sighting from wherever the bot stands).
+local function parseCreatureGuid(guid)
     if not guid then
-        return nil
+        return nil, nil
     end
 
-    local low = string.match(guid, "(%x+)$")
-    if not low then
-        return nil
+    local hex = string.match(guid, "(%x+)$")
+    if not hex or string.len(hex) ~= 16 then
+        return nil, nil
     end
 
-    if string.len(low) > 8 then
-        low = string.sub(low, -8)
+    if string.upper(string.sub(hex, 1, 4)) ~= "F130" then
+        return nil, nil
     end
 
-    return tonumber(low, 16)
+    local entry = tonumber(string.sub(hex, 5, 10), 16)
+    local spawnId = tonumber(string.sub(hex, 11, 16), 16)
+    if not spawnId or spawnId == 0 then
+        return nil, nil
+    end
+
+    return spawnId, entry
 end
 
 function NT:GetNow()
@@ -1044,7 +1059,7 @@ function NT:RefreshFromSources()
     self:RequestPeerSync()
 end
 
-function NT:ReportSighting(spawnId)
+function NT:ReportSighting(spawnId, entry)
     if not spawnId or not self.db.reportSightingsToServer then
         return
     end
@@ -1057,7 +1072,11 @@ function NT:ReportSighting(spawnId)
     end
 
     self.data.lastReportBySpawnId[spawnId] = now
-    self:SendServerCommand(string.format(".nemesis addon report %d", spawnId))
+    if entry and entry > 0 then
+        self:SendServerCommand(string.format(".nemesis addon report %d %d", spawnId, entry))
+    else
+        self:SendServerCommand(string.format(".nemesis addon report %d", spawnId))
+    end
 end
 
 function NT:TrackKnownUnit(unit)
@@ -1065,10 +1084,25 @@ function NT:TrackKnownUnit(unit)
         return
     end
 
-    local spawnId = parseSpawnIdFromGuid(UnitGUID(unit))
-    if spawnId and self.data.nemeses[spawnId] then
-        self:ReportSighting(spawnId)
+    local spawnId, entry = parseCreatureGuid(UnitGUID(unit))
+    if not spawnId then
+        return
     end
+
+    local cached = self.data.nemeses[spawnId]
+    if not cached then
+        return
+    end
+
+    -- Cross-check entry to guard against the (rare) case where the targeted
+    -- creature's GUID counter coincidentally equals a stale cache entry's
+    -- spawn_id but for a different creature_entry. Skip this check if either
+    -- side hasn't reported an entry yet.
+    if entry and (cached.creatureEntry or 0) > 0 and cached.creatureEntry ~= entry then
+        return
+    end
+
+    self:ReportSighting(spawnId, entry)
 end
 
 function NT:OnInitialize()
@@ -1229,17 +1263,71 @@ function NT:ParseBountyChat(message)
     end
 end
 
+-- Special daily task tracking ("особое поручение") -------------------------
+-- Same chat-parsing approach as bounty contracts. Server anchors (2026-06-07,
+-- prefix-less): "Поручение принято: {имя}. {условие}" / "Поручение отменено."
+-- / "Особое поручение выполнено!" / "Время вышло."
+
+function NT:GetActiveSpecialTask()
+    return self.db and self.db.activeSpecialTask or nil
+end
+
+function NT:SetActiveSpecialTask(task)
+    if not self.db then return end
+    self.db.activeSpecialTask = task
+    if self.UI then
+        self.UI:RefreshAll()
+    end
+    if self.BountyBoard and self.BountyBoard.Refresh then
+        self.BountyBoard:Refresh()
+    end
+end
+
+function NT:ParseSpecialTaskChat(message)
+    local anchor = "Поручение принято: "
+    local startIdx = string.find(message, anchor, 1, true)
+    if startIdx then
+        local tail = string.sub(message, startIdx + string.len(anchor))
+        local name, condition = string.match(tail, "^(.-)%.%s*(.*)$")
+        name = name or tail
+        local minutes = tonumber(string.match(tail, "за (%d+) мин"))
+        self:SetActiveSpecialTask({
+            name = name,
+            condition = condition or "",
+            acceptedAt = time(),
+            durationMin = minutes,
+        })
+        return
+    end
+    if string.find(message, "Поручение отменено", 1, true)
+        or string.find(message, "Особое поручение выполнено", 1, true)
+        or string.find(message, "Время вышло", 1, true) then
+        self:SetActiveSpecialTask(nil)
+        return
+    end
+end
+
 function NT:CHAT_MSG_SYSTEM(_, message)
     self:HandleSystemMessage(message)
 
-    -- Parse bounty contract events.
-    if message and string.find(message, "Немезида", 1, true)
-        and string.find(message, "Контракт", 1, true) then
+    -- Parse bounty contract events. (The server dropped the "[Немезида]: "
+    -- prefix on 2026-06-07 — gate on the anchor word only.)
+    if message and string.find(message, "Контракт", 1, true) then
         self:ParseBountyChat(message)
     end
 
-    -- Trigger sync when a nemesis announcement appears in chat
-    if message and (string.find(message, "[Nemesis]", 1, true) or string.find(message, "Немезида", 1, true)) then
+    -- Parse special daily task events.
+    if message and string.find(message, "оручени", 1, true) then
+        self:ParseSpecialTaskChat(message)
+    end
+
+    -- Trigger sync when a nemesis announcement appears in chat. Prefix is
+    -- gone, so match the words the prefix-less announcements still carry
+    -- ("стал(а) немезидой", "достиг ранга", "затаился ... (ранг N)").
+    if message and (string.find(message, "[Nemesis]", 1, true)
+        or string.find(message, "Немезида", 1, true)
+        or string.find(message, "немезид", 1, true)
+        or string.find(message, "ранг", 1, true)) then
         self:ScheduleTimer(function()
             self:RequestBootstrap()
         end, 2)

@@ -358,6 +358,12 @@ namespace
     NemesisTickStore RegenTickAccumulators;
     TemporaryNemesisStore ActiveTemporaryNemeses;
     TemporaryNemesisTickStore TemporaryRegenTickAccumulators;
+    // Dungeon instanceIds that have seen a real player (or any player when
+    // RequireRealPlayers=0). Marked + swept on map enter, erased on map
+    // destroy. Needed because Map::AddPlayerToMap loads visibility-range
+    // grids BEFORE the player lands in the map's player list — spawn-time
+    // player checks see an empty map.
+    std::unordered_set<uint32> RealDungeonInstances;
     bool CacheLoaded = false;
 
     constexpr char NEMESIS_ADDON_PREFIX[] = "Nemesis";
@@ -1087,8 +1093,22 @@ namespace
 
         std::vector<ObjectGuid::LowType> const spawnIds = CollectBootstrapSpawnIds(player, includeAll);
 
-        SendAddonPayload(player, BuildHelloPayload(spawnIds.size()));
-        SendAddonPayload(player, Acore::StringFormat("V2:BOOTSTRAP_BEGIN:{}:{}", spawnIds.size(), uint32(GameTime::GetGameTime().count())));
+        // Temporary nemeses of the player's CURRENT map (dungeon nemeses).
+        // They never live in ActiveNemeses; bootstrap is the reliable channel
+        // because creation/enter pushes can race the loading screen.
+        std::vector<std::pair<Creature*, NemesisState>> mapTemps;
+        for (auto const& [guid, state] : ActiveTemporaryNemeses)
+        {
+            if (state.mapId != player->GetMapId())
+                continue;
+            Creature* creature = ObjectAccessor::GetCreature(*player, guid);
+            if (creature && creature->IsAlive())
+                mapTemps.push_back({ creature, state });
+        }
+
+        uint32 const total = uint32(spawnIds.size() + mapTemps.size());
+        SendAddonPayload(player, BuildHelloPayload(total));
+        SendAddonPayload(player, Acore::StringFormat("V2:BOOTSTRAP_BEGIN:{}:{}", total, uint32(GameTime::GetGameTime().count())));
 
         for (ObjectGuid::LowType spawnId : spawnIds)
         {
@@ -1097,6 +1117,12 @@ namespace
                 continue;
 
             NemesisAddonView const view = BuildAddonView(player, spawnId, itr->second);
+            SendChunkedAddonPayload(player, BuildAddonEntryPayload("BOOTSTRAP_ENTRY", view));
+        }
+
+        for (auto const& [creature, state] : mapTemps)
+        {
+            NemesisAddonView const view = BuildAddonView(player, creature->GetSpawnId(), state);
             SendChunkedAddonPayload(player, BuildAddonEntryPayload("BOOTSTRAP_ENTRY", view));
         }
 
@@ -2418,7 +2444,17 @@ namespace  // reopen anon ns
         if (!creature->IsHostileToPlayers())
             return;
 
+        // Guard for the map-enter sweep path (the OnCreatureAddWorld path
+        // already checked): never re-roll an existing nemesis.
+        NemesisState existing;
+        if (TryGetNemesisState(creature, existing))
+            return;
+
+        // Spawn-time player checks race grid preloading (see
+        // RealDungeonInstances) — accept either the marked instance or a
+        // live real player.
         if (sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.RequireRealPlayers", true)
+            && !RealDungeonInstances.count(map->GetInstanceId())
             && !MapHasRealPlayer(map))
             return;
 
@@ -2559,6 +2595,18 @@ namespace NemesisSpecialTask
             : "\u0432 \u041a\u0430\u043b\u0438\u043c\u0434\u043e\u0440\u0435";
     }
 
+    // RP-названия поручений (owner 2026-06-07).
+    char const* TaskName(uint8 type)
+    {
+        switch (type)
+        {
+            case TASK_SPEED:     return "\u0413\u043e\u0440\u044f\u0447\u0438\u0439 \u0441\u043b\u0435\u0434";
+            case TASK_CONTINENT: return "\u0417\u0430\u043c\u043e\u0440\u0441\u043a\u0430\u044f \u043e\u0445\u043e\u0442\u0430";
+            case TASK_DUNGEON:   return "\u041e\u0445\u043e\u0442\u0430 \u0432\u043e \u0442\u044c\u043c\u0435";
+        }
+        return "";
+    }
+
     bool Accept(Player* player, uint8 type, std::string& err)
     {
         TaskState& st = Load(player);
@@ -2595,6 +2643,27 @@ namespace NemesisSpecialTask
         st.param = param;
         st.completed = false;
         Persist(player, st);
+
+        // Accept confirmation, contract-style. The addon parses the
+        // anchor to show the active task.
+        std::string condition;
+        switch (type)
+        {
+            case TASK_SPEED:
+                condition = Acore::StringFormat("\u0423\u0431\u0435\u0439 \u043b\u044e\u0431\u0443\u044e \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0443 \u0437\u0430 {} \u043c\u0438\u043d.", GetSpeedLimitSeconds() / 60);
+                break;
+            case TASK_CONTINENT:
+                condition = Acore::StringFormat("\u0423\u0431\u0435\u0439 \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0443 {}.", ContinentName(param));
+                break;
+            case TASK_DUNGEON:
+                condition = "\u0421\u0440\u0430\u0437\u0438 \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0443 \u0432 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435.";
+                break;
+            default:
+                break;
+        }
+        ChatHandler(player->GetSession()).PSendSysMessage(
+            "\u041f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u043f\u0440\u0438\u043d\u044f\u0442\u043e: {}. {}",
+            TaskName(type), condition);
         return true;
     }
 
@@ -2605,6 +2674,10 @@ namespace NemesisSpecialTask
             return;
         st.acceptedAt = 0;  // day stays locked to this type
         Persist(player, st);
+
+        // Addon clears the active-task display on this anchor.
+        ChatHandler(player->GetSession()).PSendSysMessage(
+            "\u041f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u043e\u0442\u043c\u0435\u043d\u0435\u043d\u043e.");
     }
 
     // Reward is ALWAYS mailed (owner request 2026-06-07) with varied RP
@@ -4776,29 +4849,29 @@ private:
 
         uint8 const rank = NemesisReputation::GetRank(player);
 
-        // "Общие товары"
+        // Rank-named submenus (owner 2026-06-07): each menu is titled after
+        // the reputation rank that unlocks it; locked entries show a short
+        // suffix, clicking one reports the missing rank.
+
+        // "Награды послушника" (rank 1, always available)
         AddGossipItemFor(player, GOSSIP_ICON_VENDOR,
-            "\u041e\u0431\u0449\u0438\u0435 \u0442\u043e\u0432\u0430\u0440\u044b",
+            "\u041d\u0430\u0433\u0440\u0430\u0434\u044b \u043f\u043e\u0441\u043b\u0443\u0448\u043d\u0438\u043a\u0430",
             GOSSIP_SENDER_MAIN, SHOP_GENERAL_ACTION);
 
-        // "Печати и нашивки" (StatBooster)
+        // "Награды охотника" (StatBooster, rank 2)
         {
-            std::string label = "\u041f\u0435\u0447\u0430\u0442\u0438 \u0438 \u043d\u0430\u0448\u0438\u0432\u043a\u0438";
-            if (uint8 const need = ShopRankRequired(false); rank < need)
-                label += Acore::StringFormat(
-                    " (\u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044f \u0440\u0430\u043d\u0433: {})",
-                    NemesisReputation::GetRankName(need));
+            std::string label = "\u041d\u0430\u0433\u0440\u0430\u0434\u044b \u043e\u0445\u043e\u0442\u043d\u0438\u043a\u0430";
+            if (rank < ShopRankRequired(false))
+                label += " (\u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u043e)";
             AddGossipItemFor(player, GOSSIP_ICON_VENDOR, label,
                 GOSSIP_SENDER_MAIN, SHOP_STATBOOST_ACTION);
         }
 
-        // "Сумки с фамильярами"
+        // "Награды следопыта" (familiar bags, rank 3)
         {
-            std::string label = "\u0421\u0443\u043c\u043a\u0438 \u0441 \u0444\u0430\u043c\u0438\u043b\u044c\u044f\u0440\u0430\u043c\u0438";
-            if (uint8 const need = ShopRankRequired(true); rank < need)
-                label += Acore::StringFormat(
-                    " (\u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044f \u0440\u0430\u043d\u0433: {})",
-                    NemesisReputation::GetRankName(need));
+            std::string label = "\u041d\u0430\u0433\u0440\u0430\u0434\u044b \u0441\u043b\u0435\u0434\u043e\u043f\u044b\u0442\u0430";
+            if (rank < ShopRankRequired(true))
+                label += " (\u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u043e)";
             AddGossipItemFor(player, GOSSIP_ICON_VENDOR, label,
                 GOSSIP_SENDER_MAIN, SHOP_FAMILIAR_ACTION);
         }
@@ -4835,14 +4908,14 @@ private:
                     uint32 const limit = NemesisSpecialTask::GetSpeedLimitSeconds();
                     uint32 const elapsed = now - st.acceptedAt;
                     uint32 const leftMin = elapsed >= limit ? 0 : (limit - elapsed + 59) / 60;
-                    header = Acore::StringFormat("\u0423\u0431\u0435\u0439 \u043b\u044e\u0431\u0443\u044e \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0443. \u041e\u0441\u0442\u0430\u043b\u043e\u0441\u044c \u043c\u0438\u043d\u0443\u0442: {}.", leftMin);
+                    header = Acore::StringFormat("\u0413\u043e\u0440\u044f\u0447\u0438\u0439 \u0441\u043b\u0435\u0434: \u0443\u0431\u0435\u0439 \u043b\u044e\u0431\u0443\u044e \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0443. \u041e\u0441\u0442\u0430\u043b\u043e\u0441\u044c \u043c\u0438\u043d\u0443\u0442: {}.", leftMin);
                     break;
                 }
                 case NemesisSpecialTask::TASK_CONTINENT:
-                    header = Acore::StringFormat("\u0423\u0431\u0435\u0439 \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0443 {}. \u0421\u0435\u0440\u044b\u0435 \u0446\u0435\u043b\u0438 \u043d\u0435 \u0441\u0447\u0438\u0442\u0430\u044e\u0442\u0441\u044f.", NemesisSpecialTask::ContinentName(st.param));
+                    header = Acore::StringFormat("\u0417\u0430\u043c\u043e\u0440\u0441\u043a\u0430\u044f \u043e\u0445\u043e\u0442\u0430: \u0443\u0431\u0435\u0439 \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0443 {}. \u0421\u0435\u0440\u044b\u0435 \u0446\u0435\u043b\u0438 \u043d\u0435 \u0441\u0447\u0438\u0442\u0430\u044e\u0442\u0441\u044f.", NemesisSpecialTask::ContinentName(st.param));
                     break;
                 case NemesisSpecialTask::TASK_DUNGEON:
-                    header = "\u0421\u0440\u0430\u0437\u0438 \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0443 \u0432 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435. \u041e\u043d\u0438 \u0442\u0430\u044f\u0442\u0441\u044f \u0441\u0440\u0435\u0434\u0438 \u043e\u0431\u044b\u0447\u043d\u044b\u0445 \u0432\u0440\u0430\u0433\u043e\u0432.";
+                    header = "\u041e\u0445\u043e\u0442\u0430 \u0432\u043e \u0442\u044c\u043c\u0435: \u0441\u0440\u0430\u0437\u0438 \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0443 \u0432 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435. \u041e\u043d\u0438 \u0442\u0430\u044f\u0442\u0441\u044f \u0441\u0440\u0435\u0434\u0438 \u043e\u0431\u044b\u0447\u043d\u044b\u0445 \u0432\u0440\u0430\u0433\u043e\u0432.";
                     break;
                 default:
                     break;
@@ -4850,11 +4923,11 @@ private:
         }
         else if (st.type != NemesisSpecialTask::TASK_NONE)
         {
-            header = "\u0422\u044b \u043e\u0442\u043a\u0430\u0437\u0430\u043b\u0441\u044f \u043e\u0442 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u044f, \u043d\u043e \u043c\u043e\u0436\u0435\u0448\u044c \u0432\u0437\u044f\u0442\u044c \u0435\u0433\u043e \u0441\u043d\u043e\u0432\u0430.";
+            header = Acore::StringFormat("\u0422\u044b \u043e\u0442\u043a\u0430\u0437\u0430\u043b\u0441\u044f \u043e\u0442 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u044f \u00ab{}\u00bb, \u043d\u043e \u043c\u043e\u0436\u0435\u0448\u044c \u0432\u0437\u044f\u0442\u044c \u0435\u0433\u043e \u0441\u043d\u043e\u0432\u0430.", NemesisSpecialTask::TaskName(st.type));
         }
         else
         {
-            header = "\u041e\u0434\u043d\u043e \u043e\u0441\u043e\u0431\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0432 \u0434\u0435\u043d\u044c. \u041d\u0430\u0433\u0440\u0430\u0434\u0430: \u043c\u043e\u043d\u0435\u0442\u0430 \u0430\u0432\u0430\u043d\u0442\u044e\u0440\u0438\u0441\u0442\u0430.";
+            header = "\u041e\u0434\u043d\u043e \u043e\u0441\u043e\u0431\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0432 \u0434\u0435\u043d\u044c. \u041d\u0430\u0433\u0440\u0430\u0434\u0430: \u043c\u043e\u043d\u0435\u0442\u0430 \u0430\u0432\u0430\u043d\u0442\u044e\u0440\u0438\u0441\u0442\u0430 (\u043f\u0440\u0438\u0434\u0451\u0442 \u043f\u043e\u0447\u0442\u043e\u0439).";
         }
 
         if (!st.completed && !st.acceptedAt)
@@ -4862,15 +4935,15 @@ private:
             bool const locked = st.type != NemesisSpecialTask::TASK_NONE;
             if (!locked || st.type == NemesisSpecialTask::TASK_SPEED)
                 AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
-                    "\u041f\u0440\u0438\u043d\u044f\u0442\u044c: \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0430 \u043d\u0430 \u0441\u043a\u043e\u0440\u043e\u0441\u0442\u044c",
+                    "\u0413\u043e\u0440\u044f\u0447\u0438\u0439 \u0441\u043b\u0435\u0434 - \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0430 \u043d\u0430 \u0441\u043a\u043e\u0440\u043e\u0441\u0442\u044c",
                     GOSSIP_SENDER_MAIN, TASK_MENU_ACTION + NemesisSpecialTask::TASK_SPEED);
             if (!locked || st.type == NemesisSpecialTask::TASK_CONTINENT)
                 AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
-                    "\u041f\u0440\u0438\u043d\u044f\u0442\u044c: \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0430 \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u043c \u043a\u043e\u043d\u0442\u0438\u043d\u0435\u043d\u0442\u0435",
+                    "\u0417\u0430\u043c\u043e\u0440\u0441\u043a\u0430\u044f \u043e\u0445\u043e\u0442\u0430 - \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0430 \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u043c \u043a\u043e\u043d\u0442\u0438\u043d\u0435\u043d\u0442\u0435",
                     GOSSIP_SENDER_MAIN, TASK_MENU_ACTION + NemesisSpecialTask::TASK_CONTINENT);
             if (!locked || st.type == NemesisSpecialTask::TASK_DUNGEON)
                 AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
-                    "\u041f\u0440\u0438\u043d\u044f\u0442\u044c: \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0430 \u0432 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435",
+                    "\u041e\u0445\u043e\u0442\u0430 \u0432\u043e \u0442\u044c\u043c\u0435 - \u043d\u0435\u043c\u0435\u0437\u0438\u0434\u0430 \u0432 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435",
                     GOSSIP_SENDER_MAIN, TASK_MENU_ACTION + NemesisSpecialTask::TASK_DUNGEON);
         }
 
@@ -5058,6 +5131,11 @@ private:
             }
         }
 
+        // "Назад" — back to the innkeeper root menu
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+            "\u041d\u0430\u0437\u0430\u0434",
+            GOSSIP_SENDER_MAIN, SHOP_BACK_ACTION);
+
         SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
     }
 
@@ -5206,7 +5284,7 @@ private:
 class NemesisDungeonMapScript : public AllMapScript
 {
 public:
-    NemesisDungeonMapScript() : AllMapScript("NemesisDungeonMapScript", { ALLMAPHOOK_ON_PLAYER_ENTER_ALL }) { }
+    NemesisDungeonMapScript() : AllMapScript("NemesisDungeonMapScript", { ALLMAPHOOK_ON_PLAYER_ENTER_ALL, ALLMAPHOOK_ON_DESTROY_MAP }) { }
 
     void OnPlayerEnterAll(Map* map, Player* player) override
     {
@@ -5214,6 +5292,19 @@ public:
             return;
         if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
             return;
+
+        // One-time per-instance sweep: Map::AddPlayerToMap preloads the
+        // visibility-range grids BEFORE the player joins the map's player
+        // list, so spawn-time rolls saw an empty map and skipped everything.
+        // Mark the instance, then roll every loaded stateless creature once.
+        bool const realOnly = sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.RequireRealPlayers", true);
+        if ((!realOnly || !IsPlayerbotVictim(player))
+            && RealDungeonInstances.insert(map->GetInstanceId()).second)
+        {
+            for (auto const& pair : map->GetCreatureBySpawnIdStore())
+                if (Creature* candidate = pair.second)
+                    TryRollDungeonNemesis(candidate);
+        }
 
         for (auto const& [guid, state] : ActiveTemporaryNemeses)
         {
@@ -5226,6 +5317,12 @@ public:
                 continue;
             SendValidatedNemesisUpsert(player, creature->GetSpawnId(), state);
         }
+    }
+
+    void OnDestroyMap(Map* map) override
+    {
+        if (map && map->IsDungeon())
+            RealDungeonInstances.erase(map->GetInstanceId());
     }
 };
 

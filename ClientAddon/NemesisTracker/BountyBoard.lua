@@ -531,6 +531,65 @@ function BB:BuildHuntTab(parent)
     bountyBox.details:SetJustifyV("TOP")
     bountyBox.details:SetWordWrap(true)
 
+    -- Особое поручение — epic-quest styled panel below the active contract.
+    local taskBox = CreateFrame("Frame", nil, parent)
+    taskBox:SetPoint("TOPLEFT",  bountyBox, "BOTTOMLEFT",  0, -6)
+    taskBox:SetPoint("TOPRIGHT", bountyBox, "BOTTOMRIGHT", 0, -6)
+    taskBox:SetHeight(58)
+    setPageBackdrop(taskBox)
+    parent.taskBox = taskBox
+
+    taskBox.header = taskBox:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    taskBox.header:SetPoint("TOPLEFT", taskBox, "TOPLEFT", 0, -5)
+    taskBox.header:SetText("|cffa335eeОсобое поручение|r")
+
+    taskBox.title = taskBox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    taskBox.title:SetPoint("TOPLEFT", taskBox, "TOPLEFT", 0, -18)
+    taskBox.title:SetPoint("TOPRIGHT", taskBox, "TOPRIGHT", 0, -18)
+    taskBox.title:SetJustifyH("LEFT")
+
+    taskBox.details = taskBox:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    taskBox.details:SetPoint("TOPLEFT", taskBox, "TOPLEFT", 0, -32)
+    taskBox.details:SetPoint("BOTTOMRIGHT", taskBox, "BOTTOMRIGHT", 0, 4)
+    taskBox.details:SetJustifyH("LEFT")
+    taskBox.details:SetJustifyV("TOP")
+    taskBox.details:SetWordWrap(true)
+
+    -- Live countdown for the timed task: re-render once a second while the
+    -- hunt tab is visible (taskBox is hidden together with the tab content).
+    taskBox._acc = 0
+    taskBox:SetScript("OnUpdate", function(frame, elapsed)
+        frame._acc = frame._acc + elapsed
+        if frame._acc < 1 then return end
+        frame._acc = 0
+        local task = NT.GetActiveSpecialTask and NT:GetActiveSpecialTask()
+        if task and task.durationMin then
+            BB:RenderSpecialTaskBox(parent)
+        end
+    end)
+end
+
+-- Renders only the special-task panel (called from RenderHuntTab and the
+-- 1-second countdown ticker).
+function BB:RenderSpecialTaskBox(content)
+    local taskBox = content and content.taskBox
+    if not taskBox then return end
+
+    local task = NT.GetActiveSpecialTask and NT:GetActiveSpecialTask()
+    if task then
+        taskBox.title:SetText("|cffa335ee" .. (task.name or "Поручение") .. "|r")
+        local detail = task.condition or ""
+        if task.durationMin and task.acceptedAt then
+            local left = task.acceptedAt + task.durationMin * 60 - time()
+            if left < 0 then left = 0 end
+            detail = detail .. string.format("\n|cffffd100Осталось: %d:%02d|r",
+                math.floor(left / 60), math.floor(left % 60))
+        end
+        taskBox.details:SetText(detail)
+    else
+        taskBox.title:SetText("|cff808080Нет активного поручения|r")
+        taskBox.details:SetText("|cffa0a0a0Спросите трактирщика об особом поручении.|r")
+    end
 end
 
 ----------------------------------------------------------------
@@ -724,6 +783,8 @@ function BB:RenderHuntTab()
             "|cffa0a0a0Посетите трактирщика, чтобы принять охоту на голову.|r")
     end
 
+    -- Особое поручение
+    self:RenderSpecialTaskBox(content)
 end
 
 function BB:RenderZoneTab()
