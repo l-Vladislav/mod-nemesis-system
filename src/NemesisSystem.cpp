@@ -2417,57 +2417,67 @@ namespace  // reopen anon ns
                     ChatHandler(player->GetSession()).SendSysMessage(message);
     }
 
-    void TryRollDungeonNemesis(Creature* creature)
+    // Single atmospheric dungeon announcement (owner 2026-06-07): no names,
+    // no ranks - the group just senses the danger. Map-local only.
+    void AnnounceDungeonPresence(Map* map)
+    {
+        AnnounceToMap(map, "\u0412\u044b \u0447\u0443\u0432\u0441\u0442\u0432\u0443\u0435\u0442\u0435 \u043f\u0440\u0438\u0441\u0443\u0442\u0441\u0442\u0432\u0438\u0435 \u0441\u0438\u043b\u044c\u043d\u043e\u0433\u043e \u0432\u0440\u0430\u0433\u0430 \u0432 \u044d\u0442\u043e\u043c \u043c\u0435\u0441\u0442\u0435.");
+    }
+
+    // Returns true when the creature became a dungeon nemesis. Pass
+    // announce=false from the map-enter sweep, which sends ONE presence
+    // message for the whole batch instead of one per birth.
+    bool TryRollDungeonNemesis(Creature* creature, bool announce = true)
     {
         if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
-            return;
+            return false;
         if (!sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.Enable", true))
-            return;
+            return false;
 
         Map* map = creature->GetMap();
         if (!map || !map->IsDungeon() || map->IsBattlegroundOrArena())
-            return;
+            return false;
         if (map->IsRaid() && !sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.IncludeRaids", false))
-            return;
+            return false;
 
-        // Trash and elites only — bosses keep their scripted encounters.
+        // Trash and elites only - bosses keep their scripted encounters.
         if (!creature->IsAlive() || creature->IsPet() || creature->IsCritter()
             || creature->IsTotem() || creature->IsTrigger())
-            return;
+            return false;
         CreatureTemplate const* tmpl = creature->GetCreatureTemplate();
         if (!tmpl || tmpl->npcflag != 0 || creature->IsCivilian())
-            return;
+            return false;
         if (tmpl->rank != CREATURE_ELITE_NORMAL && tmpl->rank != CREATURE_ELITE_ELITE)
-            return;
+            return false;
         if (creature->IsDungeonBoss() || creature->isWorldBoss())
-            return;
+            return false;
         if (!creature->IsHostileToPlayers())
-            return;
+            return false;
 
         // Guard for the map-enter sweep path (the OnCreatureAddWorld path
         // already checked): never re-roll an existing nemesis.
         NemesisState existing;
         if (TryGetNemesisState(creature, existing))
-            return;
+            return false;
 
         // Spawn-time player checks race grid preloading (see
-        // RealDungeonInstances) — accept either the marked instance or a
+        // RealDungeonInstances) - accept either the marked instance or a
         // live real player.
         if (sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.RequireRealPlayers", true)
             && !RealDungeonInstances.count(map->GetInstanceId())
             && !MapHasRealPlayer(map))
-            return;
+            return false;
 
         float const chance = sConfigMgr->GetOption<float>("NemesisSystem.DungeonNemesis.Chance", 3.0f);
         if (chance <= 0.0f || !roll_chance_f(chance))
-            return;
+            return false;
 
         NemesisState state = BuildInitialNemesisState(creature, nullptr);
         state.rank = RollDungeonNemesisRank();
         state.lastPromotionAt = state.createdAt;
         RollAffixes(state);
 
-        // Temp store directly — never SaveNemesisState (DB path).
+        // Temp store directly - never SaveNemesisState (DB path).
         ActiveTemporaryNemeses[creature->GetGUID()] = state;
         ApplyNemesisState(creature, state);
         creature->SetFullHealth();
@@ -2479,9 +2489,9 @@ namespace  // reopen anon ns
             if (Player* player = itr->GetSource())
                 SendValidatedNemesisUpsert(player, creature->GetSpawnId(), state);
 
-        // "{} затаился(ась) в этом подземелье (ранг N)!"
-        AnnounceToMap(map, Acore::StringFormat("{} \u0437\u0430\u0442\u0430\u0438\u043b\u0441\u044f(\u0430\u0441\u044c) \u0432 \u044d\u0442\u043e\u043c \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435 (\u0440\u0430\u043d\u0433 {})!",
-            creature->GetName(), state.rank));
+        if (announce)
+            AnnounceDungeonPresence(map);
+        return true;
     }
 }
 
@@ -2906,7 +2916,13 @@ public:
             std::string message = revenge
                 ? Acore::StringFormat("{} \xD0\xBE\xD1\x82\xD0\xBC\xD1\x81\xD1\x82\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank)
                 : Acore::StringFormat("{} \xD1\x83\xD1\x81\xD1\x82\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank);
-            BroadcastNemesisMessage(killed, message);
+
+            // Dungeon nemesis kills stay map-local (owner 2026-06-07) - the
+            // whole server does not need a feed of every instance run.
+            if (killed->GetMap() && killed->GetMap()->IsDungeon())
+                AnnounceToMap(killed->GetMap(), message);
+            else
+                BroadcastNemesisMessage(killed, message);
         }
     }
 
@@ -5301,9 +5317,15 @@ public:
         if ((!realOnly || !IsPlayerbotVictim(player))
             && RealDungeonInstances.insert(map->GetInstanceId()).second)
         {
+            uint32 births = 0;
             for (auto const& pair : map->GetCreatureBySpawnIdStore())
                 if (Creature* candidate = pair.second)
-                    TryRollDungeonNemesis(candidate);
+                    if (TryRollDungeonNemesis(candidate, false))
+                        ++births;
+
+            // One presence message for the whole sweep, not one per birth.
+            if (births)
+                AnnounceDungeonPresence(map);
         }
 
         for (auto const& [guid, state] : ActiveTemporaryNemeses)
