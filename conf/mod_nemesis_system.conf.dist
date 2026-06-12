@@ -615,6 +615,16 @@ NemesisSpecialTask.Enable = 1
 NemesisSpecialTask.SpeedKillMinutes = 120
 
 #
+#    NemesisSpecialTask.TargetLevelBand
+#        Description: World-task targets (speed/continent) must be within
+#                     +- this many levels of the player - both for the named
+#                     target selection and for kill credit.
+#        Default:     3
+#
+
+NemesisSpecialTask.TargetLevelBand = 3
+
+#
 #    NemesisSpecialTask.FreeChoice
 #        Description: TESTING — show all three tasks instead of the assigned
 #                     daily roll. Leave 0 in production.

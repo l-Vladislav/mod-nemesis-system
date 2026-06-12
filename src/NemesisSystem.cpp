@@ -2649,6 +2649,13 @@ namespace NemesisSpecialTask
         return Acore::StringFormat("{} \u0447 {} \u043c\u0438\u043d", h, m);
     }
 
+    // Owner 2026-06-12: world-task targets must be within +-Band levels
+    // of the player (selection AND credit).
+    int32 GetTargetLevelBand()
+    {
+        return int32(sConfigMgr->GetOption<uint32>("NemesisSpecialTask.TargetLevelBand", 3));
+    }
+
     uint32 GetSpeedLimitSeconds()
     {
         return std::max<uint32>(60, sConfigMgr->GetOption<uint32>("NemesisSpecialTask.SpeedKillMinutes", 120) * 60);
@@ -2871,7 +2878,8 @@ namespace NemesisSpecialTask
             return 0;
 
         bool const needElite = (type == TASK_CONTINENT);
-        uint8 const grayLevel = Acore::XP::GetGrayLevel(player->GetLevel());
+        int32 const band = GetTargetLevelBand();
+        int32 const plevel = int32(player->GetLevel());
 
         // Uniform reservoir over EXISTING nemeses, WORLD-WIDE (owner
         // 2026-06-11: speed hunts a random non-gray nemesis anywhere, no
@@ -2884,7 +2892,9 @@ namespace NemesisSpecialTask
             if (state.mapId != param)
                 continue;
             CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(state.creatureEntry);
-            if (!tmpl || tmpl->maxlevel <= grayLevel)
+            // The whole template band must sit inside player +-Band so any
+            // rolled spawn level is guaranteed to count.
+            if (!tmpl || int32(tmpl->minlevel) < plevel - band || int32(tmpl->maxlevel) > plevel + band)
                 continue;
             if (needElite && tmpl->rank != CREATURE_ELITE_ELITE
                 && tmpl->rank != CREATURE_ELITE_RAREELITE
@@ -2912,12 +2922,11 @@ namespace NemesisSpecialTask
         uint32 const playerZone = player->GetZoneId();
         Creature* zonePick = nullptr; uint32 zoneSeen = 0;
         Creature* mapPick = nullptr;  uint32 mapSeen = 0;
+        Creature* closest = nullptr;  int32 closestDiff = 0x7FFFFFFF;
         for (auto const& pair : map->GetCreatureBySpawnIdStore())
         {
             Creature* c = pair.second;
             if (!c || !IsEligibleAmbientCandidate(c))
-                continue;
-            if (c->GetLevel() <= grayLevel)
                 continue;
             uint32 const crank = c->GetCreatureTemplate()->rank;
             if (needElite)
@@ -2927,6 +2936,17 @@ namespace NemesisSpecialTask
             }
             else if (crank != CREATURE_ELITE_NORMAL)
                 continue;  // speed: ordinary prey only
+
+            // Last-resort fallback: the closest-level candidate, band or not
+            // (owner 2026-06-12: a target must ALWAYS be born).
+            int32 const diff = std::abs(int32(c->GetLevel()) - plevel);
+            if (diff < closestDiff)
+            {
+                closestDiff = diff;
+                closest = c;
+            }
+            if (diff > band)
+                continue;
             ++mapSeen;
             if (urand(1, mapSeen) == 1)
                 mapPick = c;
@@ -2938,7 +2958,8 @@ namespace NemesisSpecialTask
             }
         }
 
-        if (Creature* pick = zonePick ? zonePick : mapPick)
+        Creature* pick = zonePick ? zonePick : (mapPick ? mapPick : closest);
+        if (pick)
         {
             PromoteAmbientNemesis(pick, false, HunterRankBonus(player));  // silent, hunter-scaled
             return uint32(pick->GetSpawnId());
@@ -3005,6 +3026,24 @@ namespace NemesisSpecialTask
         st.targetSpawn = (type == TASK_DUNGEON)
             ? PickTargetDungeonMap(player)
             : PickWorldTarget(player, type, param);
+
+        // Push the named target straight to the accepter's addon - the
+        // zone push at breeding only reaches players near the target.
+        if (st.targetSpawn && type != TASK_DUNGEON)
+        {
+            NemesisState tstate;
+            if (TryGetNemesisState(ObjectGuid::LowType(st.targetSpawn), tstate))
+                SendValidatedNemesisUpsert(player, ObjectGuid::LowType(st.targetSpawn), tstate);
+        }
+
+        // ONLY the named target completes a world hunt - a target MUST exist.
+        if ((type == TASK_SPEED || type == TASK_CONTINENT) && !st.targetSpawn)
+        {
+            st.acceptedAt = 0;
+            Persist(player, st);
+            err = "\u0414\u043e\u0431\u044b\u0447\u0430 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u0430 - \u043f\u043e\u043f\u0440\u043e\u0431\u0443\u0439 \u0447\u0443\u0442\u044c \u043f\u043e\u0437\u0436\u0435.";
+            return false;
+        }
         Persist(player, st);
 
         // Accept confirmation, contract-style. The addon parses the
@@ -3130,25 +3169,18 @@ namespace NemesisSpecialTask
                         "\u0412\u0440\u0435\u043c\u044f \u0432\u044b\u0448\u043b\u043e. \u0412\u043e\u0437\u044c\u043c\u0438 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0443 \u0442\u0440\u0430\u043a\u0442\u0438\u0440\u0449\u0438\u043a\u0430 \u0437\u0430\u043d\u043e\u0432\u043e.");
                     break;
                 }
-                // NORMAL-rank, non-gray, on the continent recorded at accept
-                // (owner 2026-06-11).
-                {
-                    CreatureTemplate const* stmpl = killed->GetCreatureTemplate();
-                    ok = stmpl && stmpl->rank == CREATURE_ELITE_NORMAL
-                        && killed->GetMapId() == st.param
-                        && killed->GetLevel() > Acore::XP::GetGrayLevel(player->GetLevel());
-                }
+                // NORMAL-rank on the continent recorded at accept, within
+                // +-TargetLevelBand of the player. Misses are SILENT - the
+                // task just stays active until done (owner 2026-06-12).
+                // ONLY the named target completes the hunt (owner 2026-06-12).
+                ok = st.targetSpawn && uint32(killed->GetSpawnId()) == st.targetSpawn;
                 break;
             case TASK_CONTINENT:
             {
-                // Opposite classic continent + ELITE (elite/rare-elite/boss)
-                // + level-appropriate.
-                CreatureTemplate const* tmpl = killed->GetCreatureTemplate();
-                bool const elite = tmpl && (tmpl->rank == CREATURE_ELITE_ELITE
-                    || tmpl->rank == CREATURE_ELITE_RAREELITE
-                    || tmpl->rank == CREATURE_ELITE_WORLDBOSS);
-                ok = elite && killed->GetMapId() == st.param
-                    && killed->GetLevel() > Acore::XP::GetGrayLevel(player->GetLevel());
+                // Opposite classic continent + ELITE, within +-TargetLevelBand
+                // of the player. Misses are SILENT (owner 2026-06-12).
+                // ONLY the named target completes the hunt (owner 2026-06-12).
+                ok = st.targetSpawn && uint32(killed->GetSpawnId()) == st.targetSpawn;
                 break;
             }
             case TASK_DUNGEON:
@@ -3164,13 +3196,10 @@ namespace NemesisSpecialTask
                 if (map->IsRaid() && !sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.IncludeRaids", false))
                     break;
 
-                // The clearing is bound to the dungeon named at accept.
+                // The clearing is bound to the dungeon named at accept;
+                // kills elsewhere are silently ignored (owner 2026-06-12).
                 if (st.targetSpawn && map->GetId() != st.targetSpawn)
-                {
-                    ChatHandler(player->GetSession()).PSendSysMessage(
-                        "\u041e\u0445\u043e\u0442\u0430 \u0432\u043e \u0442\u044c\u043c\u0435: \u0442\u0432\u043e\u044f \u0446\u0435\u043b\u044c \u0436\u0434\u0451\u0442 \u0432 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435 \u00ab{}\u00bb.", DungeonName(st.targetSpawn));
                     break;
-                }
 
                 ++st.param;  // kill counter (param is continent-only otherwise)
 
