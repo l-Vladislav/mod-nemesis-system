@@ -2185,12 +2185,32 @@ namespace  // reopen anon ns
         return lines[seed % count];
     }
 
+    // Owner 2026-06-12: a regular player must be able to reach and attack
+    // the creature. Event-phase spawns (DK chain at Light's Hope) are
+    // invisible outside their phase; floating WMOs (EPL necropolises) sit
+    // hundreds of yards above the terrain and have no walkable entrance.
+    bool IsAccessibleWorldTarget(Creature* creature)
+    {
+        if (!(creature->GetPhaseMask() & PHASEMASK_NORMAL))
+            return false;
+
+        float const ground = creature->GetMap()->GetGridHeight(
+            creature->GetPositionX(), creature->GetPositionY());
+        if (ground > INVALID_HEIGHT && creature->GetPositionZ() - ground > 50.0f)
+            return false;
+
+        return true;
+    }
+
     bool IsEligibleAmbientCandidate(Creature* creature)
     {
         if (!creature || !creature->IsInWorld() || !creature->IsAlive() || !creature->GetSpawnId())
             return false;
 
         if (creature->IsPet() || creature->IsCritter() || creature->IsTotem() || creature->IsTrigger())
+            return false;
+
+        if (!IsAccessibleWorldTarget(creature))
             return false;
 
         // Friendly/service NPCs never become ambient nemeses.
@@ -2885,6 +2905,7 @@ namespace NemesisSpecialTask
         // 2026-06-11: speed hunts a random non-gray nemesis anywhere, no
         // zone preference). Template maxlevel is the level proxy for
         // unloaded ones.
+        Map* baseMap = sMapMgr->FindBaseNonInstanceMap(param);
         uint32 pickAny = 0;  uint32 seenAny = 0;
         for (auto const& [spawnId, state] : ActiveNemeses)
         {
@@ -2902,6 +2923,18 @@ namespace NemesisSpecialTask
                 continue;
             if (!needElite && tmpl->rank != CREATURE_ELITE_NORMAL)
                 continue;  // speed: ordinary prey only
+            // The named target must be reachable for a regular player
+            // (owner 2026-06-12: a task target sat inside a floating
+            // necropolis). Classic births happen wherever bots die, so
+            // verify the live creature; unresolvable spawns (unloaded
+            // grid) are skipped - breeding below guarantees a target.
+            Creature* live = FindLoadedCreatureBySpawnId(baseMap, ObjectGuid::LowType(spawnId));
+            if (!live || !live->IsAlive() || !IsAccessibleWorldTarget(live))
+                continue;
+            // Classic births include faction guards - hostile to one side
+            // only. The accepter must be able to attack the target.
+            if (live->IsFriendlyTo(player))
+                continue;
             ++seenAny;
             if (urand(1, seenAny) == 1)
                 pickAny = uint32(spawnId);
@@ -2927,6 +2960,10 @@ namespace NemesisSpecialTask
         {
             Creature* c = pair.second;
             if (!c || !IsEligibleAmbientCandidate(c))
+                continue;
+            // The accepter must be able to attack the bred target
+            // (faction guards are hostile to one side only).
+            if (c->IsFriendlyTo(player))
                 continue;
             uint32 const crank = c->GetCreatureTemplate()->rank;
             if (needElite)
