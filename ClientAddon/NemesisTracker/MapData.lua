@@ -41,7 +41,8 @@ local byZoneId = {
     [4] = { file = "BlastedLands" },
     [8] = { file = "SwampOfSorrows" },
     [10] = { file = "Duskwood" },
-    [16] = { file = "Azshara" },
+    -- NB: Blizzard's internal map file really is "Aszhara" (s-z swapped).
+    [16] = { file = "Aszhara" },
     [616] = { file = "Hyjal" },
     [1377] = { file = "Silithus" },
     [1657] = { file = "Darnassis" },
