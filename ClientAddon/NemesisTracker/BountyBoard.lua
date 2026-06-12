@@ -579,11 +579,23 @@ function BB:RenderSpecialTaskBox(content)
     if task then
         taskBox.title:SetText("|cffa335ee" .. (task.name or "Поручение") .. "|r")
         local detail = task.condition or ""
+        if task.progressTotal then
+            detail = detail .. string.format("\n|cffffd100Повержено: %d из %d|r",
+                task.progressDone or 0, task.progressTotal)
+        end
         if task.durationMin and task.acceptedAt then
             local left = task.acceptedAt + task.durationMin * 60 - time()
             if left < 0 then left = 0 end
-            detail = detail .. string.format("\n|cffffd100Осталось: %d:%02d|r",
-                math.floor(left / 60), math.floor(left % 60))
+            local h = math.floor(left / 3600)
+            local m = math.floor((left % 3600) / 60)
+            local s = math.floor(left % 60)
+            local leftText
+            if h > 0 then
+                leftText = string.format("%d ч %02d мин", h, m)
+            else
+                leftText = string.format("%d:%02d", m, s)
+            end
+            detail = detail .. string.format("\n|cffffd100Осталось: %s|r", leftText)
         end
         taskBox.details:SetText(detail)
     else

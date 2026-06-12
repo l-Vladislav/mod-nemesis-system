@@ -1297,13 +1297,35 @@ function NT:ParseSpecialTaskChat(message)
         local tail = string.sub(message, startIdx + string.len(anchor))
         local name, condition = string.match(tail, "^(.-)%.%s*(.*)$")
         name = name or tail
-        local minutes = tonumber(string.match(tail, "за (%d+) мин"))
+        -- Duration forms: "за 2 ч." / "за 1 ч 30 мин." / legacy "за 120 мин."
+        local minutes
+        local hours = tonumber(string.match(tail, "за (%d+) ч"))
+        if hours then
+            minutes = hours * 60 + (tonumber(string.match(tail, "ч (%d+) мин")) or 0)
+        else
+            minutes = tonumber(string.match(tail, "за (%d+) мин"))
+        end
+        -- Clearing quota, e.g. "...убей не менее 3 сильных чудовищ."
+        local total = tonumber(string.match(tail, "не менее (%d+)"))
         self:SetActiveSpecialTask({
             name = name,
             condition = condition or "",
             acceptedAt = time(),
             durationMin = minutes,
+            progressDone = total and 0 or nil,
+            progressTotal = total,
         })
+        return
+    end
+    -- Clearing progress: "Охота во тьме: повержено 1 из 3."
+    local done, total = string.match(message, "повержено (%d+) из (%d+)")
+    if done then
+        local task = self:GetActiveSpecialTask()
+        if task then
+            task.progressDone = tonumber(done)
+            task.progressTotal = tonumber(total)
+            self:SetActiveSpecialTask(task)
+        end
         return
     end
     if string.find(message, "Поручение отменено", 1, true)
@@ -1328,13 +1350,18 @@ function NT:CHAT_MSG_SYSTEM(_, message)
         self:ParseSpecialTaskChat(message)
     end
 
-    -- Trigger sync when a nemesis announcement appears in chat. Prefix is
-    -- gone, so match the words the prefix-less announcements still carry
-    -- ("стал(а) немезидой", "достиг ранга", "затаился ... (ранг N)").
+    -- Trigger sync when a nemesis announcement appears in chat. The word
+    -- "немезида" was RP-cleansed from announcements (2026-06-07); match the
+    -- markers the new texts carry: rank-ups/kills ("ранг"), birth flavors
+    -- ("обрёл(а)"/"стал(а)"), and the dungeon presence line ("присутствие").
     if message and (string.find(message, "[Nemesis]", 1, true)
-        or string.find(message, "Немезида", 1, true)
         or string.find(message, "немезид", 1, true)
-        or string.find(message, "ранг", 1, true)) then
+        or string.find(message, "Немезида", 1, true)
+        or string.find(message, "ранг", 1, true)
+        or string.find(message, "обрёл", 1, true)
+        or string.find(message, "обрел", 1, true)
+        or string.find(message, "стал(а)", 1, true)
+        or string.find(message, "присутствие", 1, true)) then
         self:ScheduleTimer(function()
             self:RequestBootstrap()
         end, 2)

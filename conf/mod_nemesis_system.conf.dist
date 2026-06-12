@@ -491,6 +491,16 @@ NemesisSystem.AmbientGeneration.IntervalMaxSeconds = 600
 NemesisSystem.AmbientGeneration.FillPercent = 50
 
 #
+#    NemesisSystem.AmbientGeneration.EliteChance
+#        Description: Percent chance (0-100) an ambient birth prefers an
+#                     ELITE candidate when one exists in the zone — keeps
+#                     continent-hunt (elite) targets present in the world.
+#        Default:     25
+#
+
+NemesisSystem.AmbientGeneration.EliteChance = 25
+
+#
 #    NemesisSystem.AmbientGeneration.RankUpChance
 #        Description: Percent chance (0-100) that a zone's ambient action
 #                     RANKS UP an existing live nemesis of that zone instead
@@ -528,6 +538,19 @@ NemesisSystem.AmbientGeneration.Announce = 1
 #
 
 NemesisSystem.AmbientGeneration.AnnounceZoneOnly = 1
+
+#
+#    NemesisSystem.HunterRankScaling.Enable
+#        Description: Seasoned hunters breed seasoned foes - nemeses born
+#                     around a player start with a rank bonus from their
+#                     Hunter's Covenant rank: 1-2 -> +0, 3-4 -> +1, 5 -> +2.
+#                     Applies to kill-driven creation (victim's rank),
+#                     dungeon spawns (best rank in the instance), ambient
+#                     births (best rank in the zone) and task-target breeding.
+#        Default:     1
+#
+
+NemesisSystem.HunterRankScaling.Enable = 1
 
 ########################################
 # DUNGEON NEMESES
@@ -585,21 +608,56 @@ NemesisSpecialTask.Enable = 1
 
 #
 #    NemesisSpecialTask.SpeedKillMinutes
-#        Description: Time limit for the speed-kill task.
-#        Default:     30
+#        Description: Time limit for the speed-kill task (2 hours).
+#        Default:     120
 #
 
-NemesisSpecialTask.SpeedKillMinutes = 30
+NemesisSpecialTask.SpeedKillMinutes = 120
+
+#
+#    NemesisSpecialTask.FreeChoice
+#        Description: TESTING — show all three tasks instead of the assigned
+#                     daily roll. Leave 0 in production.
+#        Default:     0
+#
+
+NemesisSpecialTask.FreeChoice = 0
+
+#
+#    NemesisSpecialTask.NoDailyLimit
+#        Description: TESTING — ignore the one-completion-per-day cap.
+#                     Leave 0 in production.
+#        Default:     0
+#
+
+NemesisSpecialTask.NoDailyLimit = 0
 
 #
 #    NemesisSpecialTask.RewardItem
-#    NemesisSpecialTask.RewardCount
-#        Description: Completion reward (default: 1x Монета авантюриста).
-#        Default:     110150 / 1
+#        Description: Reward item (Монета авантюриста).
+#        Default:     110150
 #
 
 NemesisSpecialTask.RewardItem = 110150
-NemesisSpecialTask.RewardCount = 1
+
+#
+#    NemesisSpecialTask.Reward.Speed / .Continent / .Dungeon
+#        Description: Coin count per completed task type (by difficulty).
+#        Default:     1 / 2 / 3
+#
+
+NemesisSpecialTask.Reward.Speed = 1
+NemesisSpecialTask.Reward.Continent = 1
+NemesisSpecialTask.Reward.Dungeon = 1
+
+#
+#    NemesisSpecialTask.DungeonMinKills
+#        Description: Minimum dungeon-nemesis kills for the clearing task
+#                     (plus none left alive in the instance).
+#        Default:     3
+#
+
+NemesisSpecialTask.DungeonMinKills = 3
 
 ###############################################################################
 # BOUNTY BOARD SETTINGS
@@ -757,7 +815,7 @@ NemesisRep.Enable = 1
 #        Default:     50
 #
 
-NemesisRep.BasePerKill = 50
+NemesisRep.BasePerKill = 0
 
 #
 #    NemesisRep.PerRankBonus
@@ -766,7 +824,7 @@ NemesisRep.BasePerKill = 50
 #        Default:     10
 #
 
-NemesisRep.PerRankBonus = 10
+NemesisRep.PerRankBonus = 1
 
 #
 #    NemesisRep.BountyCompletionBonus
@@ -776,7 +834,7 @@ NemesisRep.PerRankBonus = 10
 #        Default:     200
 #
 
-NemesisRep.BountyCompletionBonus = 200
+NemesisRep.BountyCompletionBonus = 10
 
 #
 #    NemesisRep.BountyCompletionPerRank
@@ -785,7 +843,18 @@ NemesisRep.BountyCompletionBonus = 200
 #        Default:     50
 #
 
-NemesisRep.BountyCompletionPerRank = 50
+NemesisRep.BountyCompletionPerRank = 5
+
+#
+#    NemesisRep.SpecialTaskBonus
+#        Description: Hunter's Covenant reputation granted on completing the
+#                     innkeeper's daily special task.
+#                     Total = Bonus + PerRank x hunter rank.
+#        Default:     100 / 1
+#
+
+NemesisRep.SpecialTaskBonus = 100
+NemesisRep.SpecialTaskPerRank = 1
 
 #
 #    NemesisRep.Threshold.Rank2..Rank5
