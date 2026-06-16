@@ -9,8 +9,9 @@ local NT = NemesisTracker
 NT.BountyBoard = NT.BountyBoard or {}
 local BB = NT.BountyBoard
 
--- Rank metadata — mirrors server NemesisReputation tiers. Thresholds here
--- are for display only; the server is the source of truth for the rank.
+-- Rank metadata. The server is the source of truth for the rank AND its
+-- thresholds: every payload carries repRank + repTierFloor/repTierNext, so the
+-- bar curve is never hardcoded here (it can't drift from the server config).
 local RANK_NAMES = {
     [1] = "Послушник",
     [2] = "Охотник",
@@ -18,8 +19,6 @@ local RANK_NAMES = {
     [4] = "Ветеран Охоты",
     [5] = "Легенда Охоты",
 }
-
-local RANK_THRESHOLDS = { 0, 500, 2500, 8000, 20000 }
 
 -- Tier colors mirror Blizz FACTION_BAR_COLORS so the rep bar reads as a
 -- native rep bar (Neutral → Friendly → Honored → Revered → Exalted).
@@ -721,11 +720,13 @@ function BB:FindActiveBountyNemesis()
     return nil
 end
 
--- Pulls repPoints/repRank from whichever nemesis entry has them populated.
--- Server writes them onto every outgoing addon payload per player, so any
--- stored entry's rep fields are current.
+-- Pulls the rep snapshot (points, rank, tier floor, next-tier threshold) from
+-- whichever nemesis entry has them populated. The server writes them onto
+-- every outgoing payload per player, so any stored entry's rep fields are
+-- current. Peer-shared entries carry none (0/nil), so they always lose the
+-- per-field max below; rep only ever increases, so the newest stamp wins.
 function BB:ReadRepSnapshot()
-    local points, rank = 0, 1
+    local points, rank, tierFloor, tierNext = 0, 1, 0, 0
     for _, nemesis in pairs(NT.data.nemeses or {}) do
         if nemesis.repPoints and nemesis.repPoints > points then
             points = nemesis.repPoints
@@ -733,8 +734,14 @@ function BB:ReadRepSnapshot()
         if nemesis.repRank and nemesis.repRank > rank then
             rank = nemesis.repRank
         end
+        if nemesis.repTierFloor and nemesis.repTierFloor > tierFloor then
+            tierFloor = nemesis.repTierFloor
+        end
+        if nemesis.repTierNext and nemesis.repTierNext > tierNext then
+            tierNext = nemesis.repTierNext
+        end
     end
-    return points, rank
+    return points, rank, tierFloor, tierNext
 end
 
 function BB:RenderHuntTab()
@@ -746,7 +753,7 @@ function BB:RenderHuntTab()
 
     -- Reputation footer (frame-level widgets, shared across tabs).
     local frame = self.frame
-    local points, rank = self:ReadRepSnapshot()
+    local points, rank, tierFloor, tierNext = self:ReadRepSnapshot()
     local rankName = RANK_NAMES[rank] or "—"
     local r, g, b = rankColorByTier(rank)
     if frame.repRankText then
@@ -756,20 +763,28 @@ function BB:RenderHuntTab()
     end
 
     if frame.repBar then
-        if rank >= 5 then
+        -- Bar bounds come from the server (repTierFloor/repTierNext); the addon
+        -- holds no rank curve, so the bar can't drift from the server config.
+        if rank >= #RANK_NAMES then
+            -- Max rank: full bar (checked first so a stale lower-rank stamp's
+            -- non-zero tierNext can't override the maxed display).
             frame.repBar:SetValue(1)
             if frame.repBarLabel then
                 frame.repBarLabel:SetText(string.format("%d (макс)", points))
             end
-        else
-            local nextThreshold = RANK_THRESHOLDS[rank + 1] or (points + 1)
-            local curThreshold  = RANK_THRESHOLDS[rank] or 0
-            local span = math.max(1, nextThreshold - curThreshold)
-            local progress = math.min(1, math.max(0, (points - curThreshold) / span))
-            local curInTier = points - curThreshold
+        elseif tierNext > tierFloor then
+            local span = tierNext - tierFloor
+            local curInTier = points - tierFloor
+            local progress = math.min(1, math.max(0, curInTier / span))
             frame.repBar:SetValue(progress)
             if frame.repBarLabel then
                 frame.repBarLabel:SetText(string.format("%d / %d", curInTier, span))
+            end
+        else
+            -- Server tier bounds not received yet (cold start): show raw points.
+            frame.repBar:SetValue(0)
+            if frame.repBarLabel then
+                frame.repBarLabel:SetText(string.format("%d", points))
             end
         end
         frame.repBar:SetStatusBarColor(r, g, b)

@@ -579,6 +579,10 @@ function NT:UpsertNemesisFromFields(fields, startIndex, source)
         repPoints = tonumber(fields[startIndex + 25]) or 0,
         repRank = tonumber(fields[startIndex + 26]) or 1,
         expiresAt = tonumber(fields[startIndex + 27]) or 0,
+        -- Server-authoritative rank-bar bounds (appended after expiresAt). Peer
+        -- shares omit them, so peer entries leave these nil/0 and lose the max.
+        repTierFloor = tonumber(fields[startIndex + 28]) or 0,
+        repTierNext = tonumber(fields[startIndex + 29]) or 0,
         lastSeenSource = source,
         isAlive = true,
         removeReason = nil,

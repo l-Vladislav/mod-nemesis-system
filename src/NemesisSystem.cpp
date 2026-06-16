@@ -69,6 +69,7 @@ namespace NemesisReputation
     bool   AddPoints(Player* player, uint32 amount);
     uint32 GetPoints(Player* player);
     uint8  GetRank(Player* player);
+    uint32 GetThreshold(uint8 rank);
     void   OnLogin(Player* player);
     void   OnLogout(Player* player);
 }
@@ -144,6 +145,8 @@ namespace
         uint32 repPoints  = 0;
         uint8  repRank    = 1;
         uint32 expiresAt  = 0;  // active bounty's expiry (0 if not this player's bounty)
+        uint32 repTierFloor = 0; // rep points at the current rank's floor
+        uint32 repTierNext  = 0; // rep points to reach the next rank (0 = max rank)
     };
 
     // Nemesis title generator — deterministic from spawnId + creatureEntry
@@ -974,6 +977,10 @@ namespace
         {
             view.repPoints = NemesisReputation::GetPoints(player);
             view.repRank   = NemesisReputation::GetRank(player);
+            // Tier bounds so the client never hardcodes the rank curve.
+            view.repTierFloor = NemesisReputation::GetThreshold(view.repRank);
+            view.repTierNext  = view.repRank >= GetMaxRank()
+                ? 0 : NemesisReputation::GetThreshold(view.repRank + 1);
 
             NemesisBountyBoard::ActiveBounty active;
             if (NemesisBountyBoard::GetActiveBounty(player, active)
@@ -989,7 +996,7 @@ namespace
     std::string BuildAddonEntryPayload(char const* opcode, NemesisAddonView const& view)
     {
         return Acore::StringFormat(
-            "V2:{}:{}:{}:{}:{}:{}:{}:{:.1f}:{:.1f}:{:.1f}:{:.2f}:{:.2f}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "V2:{}:{}:{}:{}:{}:{}:{}:{:.1f}:{:.1f}:{:.1f}:{:.2f}:{:.2f}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             opcode,
             uint64(view.spawnId),
             view.creatureEntry,
@@ -1018,7 +1025,9 @@ namespace
             view.localizedName,
             view.repPoints,
             uint32(view.repRank),
-            view.expiresAt);
+            view.expiresAt,
+            view.repTierFloor,
+            view.repTierNext);
     }
 
     std::string BuildHelloPayload(uint32 entryCount)
@@ -5047,6 +5056,8 @@ class NemesisBountyVendorScript : public AllCreatureScript
     static constexpr uint32 SHOP_VETERAN_ACTION        = GOSSIP_ACTION_INFO_DEF + 9009;
     // Special daily task (особое поручение). Accept actions are
     // TASK_MENU_ACTION + TaskType (1=speed, 2=continent, 3=dungeon).
+    static constexpr uint32 RANK_INFO_ACTION           = GOSSIP_ACTION_INFO_DEF + 9015;
+
     static constexpr uint32 TASK_MENU_ACTION           = GOSSIP_ACTION_INFO_DEF + 9010;
     static constexpr uint32 TASK_ACCEPT_FIRST          = GOSSIP_ACTION_INFO_DEF + 9011;
     static constexpr uint32 TASK_ACCEPT_LAST           = GOSSIP_ACTION_INFO_DEF + 9013;
@@ -5090,6 +5101,24 @@ public:
         if (creature->IsInnkeeper())
             AddGossipItemFor(player, INNKEEPER_GOSSIP_MENU, 1,
                 GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INN);
+
+        // ── Hunter rank summary (opens a read-only progress screen) ──
+        if (sConfigMgr->GetOption<bool>("NemesisRep.Enable", true))
+        {
+            uint8 const repRank = NemesisReputation::GetRank(player);
+            uint32 const repPoints = NemesisReputation::GetPoints(player);
+            // menu line: "Ранг: «<name>» - <points>/<next>" (or " (макс)")
+            std::string rankLine = repRank >= GetMaxRank()
+                ? Acore::StringFormat(
+                    "Ранг: «{}» - {} (макс)",
+                    NemesisReputation::GetRankName(repRank), repPoints)
+                : Acore::StringFormat(
+                    "Ранг: «{}» - {}/{}",
+                    NemesisReputation::GetRankName(repRank), repPoints,
+                    NemesisReputation::GetThreshold(repRank + 1));
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, rankLine,
+                GOSSIP_SENDER_MAIN, RANK_INFO_ACTION);
+        }
 
         // ── Bounty Hunter Rewards ──
         AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
@@ -5156,6 +5185,13 @@ public:
         // ── Shop submenu: back to the innkeeper root menu ──
         if (action == SHOP_BACK_ACTION)
             return CanCreatureGossipHello(player, creature);
+
+        // ── Hunter rank info screen ──
+        if (action == RANK_INFO_ACTION)
+        {
+            ShowRankInfo(player, creature);
+            return true;
+        }
 
         // ── Special daily task menu ──
         if (action == TASK_MENU_ACTION)
@@ -5368,6 +5404,42 @@ private:
             creature->RemoveNpcFlag(UNIT_NPC_FLAG_VENDOR);
     }
 
+    // Read-only rank screen: current rank, rep points and progress to the next
+    // rank. Thresholds come from GetThreshold (config), so this never drifts
+    // from the live economy curve.
+    void ShowRankInfo(Player* player, Creature* creature)
+    {
+        ClearGossipMenuFor(player);
+
+        uint8 const rank = NemesisReputation::GetRank(player);
+        uint32 const points = NemesisReputation::GetPoints(player);
+        uint32 const tierFloor = NemesisReputation::GetThreshold(rank);
+
+        std::string header;
+        if (rank >= GetMaxRank())
+            header = Acore::StringFormat(
+                "Ранг {}: «{}».\n\nОчки почёта: {}.\n\nЭто высший ранг охотника. Дальше пути нет.",
+                rank, NemesisReputation::GetRankName(rank), points);
+        else
+        {
+            uint32 const next = NemesisReputation::GetThreshold(rank + 1);
+            uint32 const remaining = next > points ? next - points : 0;
+            header = Acore::StringFormat(
+                "Ранг {}: «{}».\n\nОчки почёта: {}.\n\nДо ранга «{}» осталось {} очк.\nВ текущем ранге: {} / {}.",
+                rank, NemesisReputation::GetRankName(rank), points,
+                NemesisReputation::GetRankName(rank + 1), remaining,
+                points - tierFloor, next - tierFloor);
+        }
+
+        // "Назад"
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Назад",
+            GOSSIP_SENDER_MAIN, SHOP_BACK_ACTION);
+
+        uint32 const customTextId = 0x7D000000u | (player->GetGUID().GetCounter() & 0x00FFFFFFu);
+        SendCustomNpcText(player, header, customTextId);
+        SendGossipMenuFor(player, customTextId, creature->GetGUID());
+    }
+
     // Rank-gated shop submenu: «Общие товары» (rank 1) / «Печати и нашивки»
     // (StatBooster, rank 2) / «Сумки с фамильярами» (rank 3). Locked entries
     // stay visible with a "(требуется ранг: …)" suffix so players see the
@@ -5541,6 +5613,12 @@ private:
                 active.targetTitle, hoursLeft, minsLeft);
             AddGossipItemFor(player, GOSSIP_ICON_TAXI, line,
                 GOSSIP_SENDER_MAIN, BOARD_ACTIVE_VIEW_ACTION);
+
+            // "Назад" — back to the innkeeper root menu. Without this the active
+            // board view is a dead end (only the [АКТИВНО] line), so the back
+            // button in the post-accept / active-bounty flow had no escape.
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Назад",
+                GOSSIP_SENDER_MAIN, SHOP_BACK_ACTION);
 
             SendGossipMenuFor(player, customTextId, creature->GetGUID());
             return;

@@ -870,10 +870,10 @@ NemesisRep.SpecialTaskPerRank = 1
 #    NemesisRep.Threshold.Rank2..Rank5
 #        Description: Rep points required to promote into each tier.
 #                     Rank 1 (Послушник) starts at 0 and has no threshold.
-#        Defaults:    500 / 2500 / 8000 / 20000
+#        Defaults:    1000 / 5000 / 16000 / 40000
 #
 
-NemesisRep.Threshold.Rank2 = 500
-NemesisRep.Threshold.Rank3 = 2500
-NemesisRep.Threshold.Rank4 = 8000
-NemesisRep.Threshold.Rank5 = 20000
+NemesisRep.Threshold.Rank2 = 1000
+NemesisRep.Threshold.Rank3 = 5000
+NemesisRep.Threshold.Rank4 = 16000
+NemesisRep.Threshold.Rank5 = 40000
