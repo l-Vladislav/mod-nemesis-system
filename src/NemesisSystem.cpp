@@ -3318,10 +3318,6 @@ public:
             player->RemoveAurasDueToSpell(spellId);
         for (uint32 spellId = 104000; spellId <= 104099; ++spellId)
             player->RemoveAurasDueToSpell(spellId);
-        // T1 fallback range (190010-012 pets) — drop when T1 migration lands.
-        player->RemoveAurasDueToSpell(101100);
-        player->RemoveAurasDueToSpell(101101);
-        player->RemoveAurasDueToSpell(101102);
     }
 
     void OnPlayerLogout(Player* player) override
@@ -3436,8 +3432,11 @@ public:
 // breaks companion-menu classification (implementation log bug #8).
 // Cast site guards 104xxx with sSpellMgr lookup so pets without a debuff
 // row (clean Commons, Rares) generate no log spam.
-// T1 pets (190010-012) retained as fallback while Phase 3 migration is in
-// flight; once T1 creature_template rows are dropped they become dead code.
+// T1 pets (190010-012) retired 2026-07-02: character_spell remapped to gacha
+// successors, old rows dropped. Entries 190010/190011 now belong to
+// mod-transmog (Warpweaver / Ethereal Warpweaver — a player-owned TempSummon),
+// so no fallback mapping may exist here or the transmog pet would get
+// familiar owner-auras applied.
 struct FamiliarAuras
 {
     uint32 buff = 0;
@@ -3455,13 +3454,6 @@ static FamiliarAuras GetFamiliarOwnerAuraSpells(uint32 entry)
         return out;
     }
 
-    FamiliarAuras t1;
-    switch (entry)
-    {
-        case 190010: t1.buff = 101100; return t1; // Guardian Wolf Cub → +1% armor
-        case 190011: t1.buff = 101101; return t1; // Falcon Chick → +1% melee crit
-        case 190012: t1.buff = 101102; return t1; // Raven Fledgling → +1% spell crit
-    }
     return {};
 }
 
