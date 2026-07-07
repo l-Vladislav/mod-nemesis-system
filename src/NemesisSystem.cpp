@@ -768,6 +768,20 @@ namespace
         if (!zoneId)
             return "Unknown";
 
+        // Manual corrections for known typos/gaps in the deployed ruRU
+        // AreaTable.dbc. "ё" is frequently dropped in favor of "е" in
+        // Russian source text (a common typography slip) — this survived
+        // into the localization data we ship. Keyed by zoneId so we only
+        // ever touch strings we've explicitly verified, never guess at
+        // declined/subzone forms. Add further entries here as they're found
+        // rather than special-casing them in addon Lua.
+        static std::unordered_map<uint32, std::string> const zoneNameOverrides =
+        {
+            { 148, "Тёмные берега" }, // Darkshore: DBC has "Темные берега" (missing ё)
+        };
+        if (auto it = zoneNameOverrides.find(zoneId); it != zoneNameOverrides.end())
+            return it->second;
+
         if (AreaTableEntry const* area = sAreaTableStore.LookupEntry(zoneId))
         {
             // ruRU server: prefer the ruRU string slot explicitly (the

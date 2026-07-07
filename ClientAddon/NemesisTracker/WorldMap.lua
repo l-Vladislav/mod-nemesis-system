@@ -165,6 +165,59 @@ local function getCurrentMapFile()
     return nil
 end
 
+-- REVERTED 2026-07-05: an earlier version of this file added
+-- getCurrentMapAreaId() using GetCurrentMapAreaID() as the primary
+-- zone-membership signal, on the theory that it returns the same AreaID
+-- space as nemesis.zoneId (AreaTable.dbc). That's wrong: in the 3.3.5a
+-- client, GetCurrentMapAreaID() returns a WorldMapArea.dbc row ID, which
+-- is a DIFFERENT numbering space than AreaTable's zone ID (e.g. Darkshore
+-- is AreaTable 148, but a different, unrelated number in WorldMapArea).
+-- Comparing across ID spaces produces wrong matches (and, per the
+-- regression report, broke the addon broadly) rather than merely failing
+-- safely. Do not reintroduce GetCurrentMapAreaID for this purpose — see
+-- agent memory nemesis-dev/worldmap-zone-matching.md.
+--
+-- Get the client-locale zone name for the PLAYER'S OWN current zone.
+-- GetRealZoneText() is a basic, unambiguous, always-available API (used
+-- since Vanilla) that always reflects where the player physically is,
+-- regardless of what map the world-map UI happens to be scrolled to. It
+-- returns text in whatever locale the client is running (ruRU here),
+-- which is exactly what the server sends as nemesis.zoneName (see
+-- NemesisSystem.cpp GetZoneName). This is intentionally used ONLY for
+-- player-zone checks (isNemesisInPlayerZone), never for "zone currently
+-- being viewed on the world map" (isNemesisInCurrentZone), since a player
+-- can legitimately scroll the map to browse a different zone than the one
+-- they're standing in.
+local function getCurrentRealZoneText()
+    if GetRealZoneText then
+        local text = GetRealZoneText()
+        if text and text ~= "" then
+            return text
+        end
+    end
+    return nil
+end
+
+-- Normalizes ё/Ё -> е/Е so a DBC typo/correction on one side (e.g. a
+-- server-side override applied in GetZoneName, or a client MPQ that
+-- hasn't been repatched with the same correction) can't cause a false
+-- negative on an otherwise-identical zone name.
+local function normalizeRu(text)
+    if not text or text == "" then
+        return ""
+    end
+    text = string.gsub(text, "Ё", "Е")
+    text = string.gsub(text, "ё", "е")
+    return text
+end
+
+local function zoneNamesMatch(nameA, nameB)
+    if not nameA or nameA == "" or not nameB or nameB == "" then
+        return false
+    end
+    return normalizeRu(nameA) == normalizeRu(nameB)
+end
+
 -- Resolve a nemesis entry to its internal map file name via MapData
 local function getNemesisMapFile(nemesis)
     if not nemesis then
@@ -220,8 +273,17 @@ local function isNemesisInCurrentZone(nemesis)
         return cur ~= nil and cur ~= 0 and nemesis.mapId == cur
     end
 
-    -- Primary: compare locale-independent map file names
-    -- This works on any client language (RU, EN, DE, etc.)
+    -- This checks the zone the world-map UI is currently DISPLAYING, which
+    -- can legitimately differ from the player's own physical zone (e.g. the
+    -- player scrolled the map to browse a different zone) — so, unlike
+    -- isNemesisInPlayerZone below, this deliberately does NOT use
+    -- GetRealZoneText() (that always reflects the player's own location,
+    -- which would incorrectly bleed the player's home-zone nemeses onto
+    -- whatever other zone's map they're browsing).
+    --
+    -- Compare locale-independent map file names via MapData. This works on
+    -- any client language (RU, EN, DE, etc.) as long as MapData's byZoneId
+    -- table has the correct Blizzard-internal folder name for the zone.
     local currentFile = getCurrentMapFile()
     if currentFile then
         local nemesisFile = getNemesisMapFile(nemesis)
@@ -229,14 +291,6 @@ local function isNemesisInCurrentZone(nemesis)
             return true
         end
     end
-
-    -- Fallback: if the world map is open, SetMapToCurrentZone may have
-    -- been called, so also try matching the zone ID directly against
-    -- MapData's byZoneId table via the file name approach above.
-    -- If we reach here, the nemesis zone is not in MapData — try
-    -- a direct zoneId match with the nemesis data's own zoneId field
-    -- by checking if any other nemesis in the same zoneId has a
-    -- matching file (already covered above).
 
     return false
 end
@@ -290,12 +344,32 @@ local function getPlayerZoneFile()
     return cachedPlayerZoneFile
 end
 
+-- Unlike isNemesisInCurrentZone (zone the world-map UI is displaying),
+-- this is always about the PLAYER'S OWN physical zone, so GetRealZoneText()
+-- is the semantically correct signal here (no "browsing a different zone"
+-- ambiguity to worry about). Additive only: falls through to the existing
+-- file-name check on a miss, never blocks it.
 local function isNemesisInPlayerZone(nemesis, playerFile)
-    if not nemesis or not playerFile then
+    if not nemesis then
+        return false
+    end
+    if zoneNamesMatch(getCurrentRealZoneText(), nemesis.zoneName) then
+        return true
+    end
+    if not playerFile then
         return false
     end
     local nemesisFile = getNemesisMapFile(nemesis)
     return nemesisFile and nemesisFile == playerFile
+end
+
+-- Public alias for other modules (e.g. BountyBoard's "this zone" tab). Use
+-- THIS — not IsNemesisInCurrentZone — for anything conceptually about "is
+-- this nemesis where I'm standing", since that's the semantic this checks
+-- (see the comments on isNemesisInCurrentZone / isNemesisInPlayerZone
+-- above for why the two aren't interchangeable).
+function WM.IsNemesisInPlayerZone(nemesis)
+    return isNemesisInPlayerZone(nemesis, getPlayerZoneFile())
 end
 
 local function getAllNemesesSorted()

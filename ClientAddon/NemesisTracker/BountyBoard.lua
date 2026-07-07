@@ -818,9 +818,12 @@ function BB:RenderZoneTab()
     local content = self.frame.tabContent[2]
     if not content or not content.rows then return end
 
-    -- Collect zone nemeses via WorldMap's locale-independent matcher.
+    -- Collect zone nemeses via WorldMap's player-zone matcher (this tab
+    -- means "zone I'm standing in", not "zone the world map happens to be
+    -- scrolled to" — IsNemesisInCurrentZone is the wrong check here, see
+    -- comments in WorldMap.lua on isNemesisInCurrentZone/isNemesisInPlayerZone).
     local zoneList = {}
-    local inZone = NT.WorldMap and NT.WorldMap.IsNemesisInCurrentZone
+    local inZone = NT.WorldMap and NT.WorldMap.IsNemesisInPlayerZone
     for _, nemesis in pairs(NT.data.nemeses or {}) do
         if inZone and inZone(nemesis) then
             table.insert(zoneList, nemesis)
