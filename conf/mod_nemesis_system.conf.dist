@@ -362,6 +362,25 @@ NemesisSystem.AddonBootstrapRecentHours = 24
 NemesisSystem.AddonBootstrapMaxEntries = 100
 
 #
+#    NemesisSystem.AddonBootstrapEntriesPerTick
+#        Description: Perf pacing for `.nemesis addon bootstrap`/`sync`
+#                     (includeAll=true, unfiltered by MaxEntries above — the
+#                     "full" bootstrap used to build+send every active
+#                     nemesis world-wide synchronously in one command,
+#                     which could block the main thread for ~190ms on a
+#                     busy world). This caps how many nemesis entries may be
+#                     built+sent per world tick, shared across every
+#                     player's in-flight bootstrap that tick; the rest
+#                     drains over subsequent ticks. Lower = smaller per-tick
+#                     hit but slower to finish; higher = faster but bigger
+#                     per-tick hit. Does not change what gets sent, only how
+#                     it's paced.
+#        Default:     50
+#
+
+NemesisSystem.AddonBootstrapEntriesPerTick = 50
+
+#
 #    NemesisSystem.AddonReportCooldownSeconds
 #        Description: Minimum time between validated addon sighting updates for
 #                     the same nemesis spawn.

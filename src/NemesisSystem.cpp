@@ -373,6 +373,22 @@ namespace
     std::unordered_map<uint32, uint32> LastDungeonPresenceTs;
     bool CacheLoaded = false;
 
+    // Perf pacing state for SendNemesisBootstrap — see
+    // GetAddonBootstrapEntriesPerTick() and ProcessPendingBootstraps().
+    // spawnIds/tempGuids are the already-computed, already-sorted work list
+    // for one player's in-flight bootstrap; *Index tracks how far the drain
+    // has progressed. tempGuids are ActiveTemporaryNemeses keys, re-resolved
+    // to a live Creature* at drain time (never held across ticks) since the
+    // dungeon creature can legitimately die/despawn mid-drain.
+    struct PendingBootstrap
+    {
+        std::vector<ObjectGuid::LowType> spawnIds;
+        std::vector<ObjectGuid> tempGuids;
+        size_t spawnIndex = 0;
+        size_t tempIndex = 0;
+    };
+    std::unordered_map<ObjectGuid, PendingBootstrap> PendingBootstraps;
+
     constexpr char NEMESIS_ADDON_PREFIX[] = "Nemesis";
     size_t constexpr NEMESIS_ADDON_CHUNK_SIZE = 450;
 
@@ -521,6 +537,19 @@ namespace
     uint32 GetAddonBootstrapMaxEntries()
     {
         return std::max<uint32>(1, sConfigMgr->GetOption<uint32>("NemesisSystem.AddonBootstrapMaxEntries", 100));
+    }
+
+    // Perf pacing: `.nemesis addon bootstrap/sync` (includeAll=true) can walk
+    // every non-expired ActiveNemeses entry world-wide (ambient generation
+    // keeps most populated zones near MaxPerZone, so this is easily 500-1500+
+    // entries). Building+sending them all synchronously in one command
+    // invocation measured ~190ms of blocked main-thread time on live. This
+    // caps how many entries ProcessPendingBootstraps() may build+send per
+    // world tick (shared across all in-flight players' queues that tick), so
+    // the wire protocol/content is unchanged but the work is spread out.
+    uint32 GetAddonBootstrapEntriesPerTick()
+    {
+        return std::max<uint32>(1, sConfigMgr->GetOption<uint32>("NemesisSystem.AddonBootstrapEntriesPerTick", 50));
     }
 
     uint32 GetAddonReportCooldownSeconds()
@@ -1133,47 +1162,120 @@ namespace
                 callback(player);
     }
 
+    // Queues a player's bootstrap: the spawnId/tempGuid work list is computed
+    // right away (cheap — just map iteration + a sort, no per-entry
+    // formatting/packet work), HELLO + BOOTSTRAP_BEGIN go out immediately so
+    // the addon's progress bar starts, and the actual per-entry
+    // BuildAddonView + SendChunkedAddonPayload work (the expensive part) is
+    // drained a bounded number of entries per world tick by
+    // ProcessPendingBootstraps(). Wire protocol/content is unchanged from
+    // the old fully-synchronous version — only the pacing changed.
     void SendNemesisBootstrap(Player* player, bool includeAll = false)
     {
         if (!player)
             return;
 
-        std::vector<ObjectGuid::LowType> const spawnIds = CollectBootstrapSpawnIds(player, includeAll);
+        std::vector<ObjectGuid::LowType> spawnIds = CollectBootstrapSpawnIds(player, includeAll);
 
         // Temporary nemeses of the player's CURRENT map (dungeon nemeses).
         // They never live in ActiveNemeses; bootstrap is the reliable channel
-        // because creation/enter pushes can race the loading screen.
-        std::vector<std::pair<Creature*, NemesisState>> mapTemps;
+        // because creation/enter pushes can race the loading screen. Only the
+        // guid keys are snapshotted here — liveness is re-checked at drain
+        // time in ProcessPendingBootstraps(), since a dungeon creature can
+        // legitimately die/despawn during a multi-tick drain.
+        std::vector<ObjectGuid> tempGuids;
         for (auto const& [guid, state] : ActiveTemporaryNemeses)
         {
             if (state.mapId != player->GetMapId())
                 continue;
             Creature* creature = ObjectAccessor::GetCreature(*player, guid);
             if (creature && creature->IsAlive())
-                mapTemps.push_back({ creature, state });
+                tempGuids.push_back(guid);
         }
 
-        uint32 const total = uint32(spawnIds.size() + mapTemps.size());
+        uint32 const total = uint32(spawnIds.size() + tempGuids.size());
         SendAddonPayload(player, BuildHelloPayload(total));
         SendAddonPayload(player, Acore::StringFormat("V2:BOOTSTRAP_BEGIN:{}:{}", total, uint32(GameTime::GetGameTime().count())));
 
-        for (ObjectGuid::LowType spawnId : spawnIds)
+        if (spawnIds.empty() && tempGuids.empty())
         {
-            NemesisStore::const_iterator itr = ActiveNemeses.find(spawnId);
-            if (itr == ActiveNemeses.end())
+            SendAddonPayload(player, "V2:BOOTSTRAP_END");
+            return;
+        }
+
+        // Re-requesting while a previous bootstrap for this player is still
+        // draining simply restarts the queue (old END is never sent, but
+        // that's harmless — the addon only awaits/uses the most recent one).
+        PendingBootstrap& pending = PendingBootstraps[player->GetGUID()];
+        pending.spawnIds = std::move(spawnIds);
+        pending.tempGuids = std::move(tempGuids);
+        pending.spawnIndex = 0;
+        pending.tempIndex = 0;
+    }
+
+    // Drains queued bootstraps, up to GetAddonBootstrapEntriesPerTick()
+    // entries total *across all players* per call, so one call's added
+    // main-thread cost is bounded regardless of how many bootstraps happen
+    // to be in flight at once. Called every world tick from
+    // NemesisAmbientWorldScript::OnUpdate (cheap no-op when nothing queued).
+    void ProcessPendingBootstraps()
+    {
+        if (PendingBootstraps.empty())
+            return;
+
+        uint32 budget = GetAddonBootstrapEntriesPerTick();
+
+        for (auto itr = PendingBootstraps.begin(); itr != PendingBootstraps.end() && budget > 0;)
+        {
+            Player* player = HashMapHolder<Player>::Find(itr->first);
+            if (!player || !player->GetSession())
+            {
+                itr = PendingBootstraps.erase(itr);
                 continue;
+            }
 
-            NemesisAddonView const view = BuildAddonView(player, spawnId, itr->second);
-            SendChunkedAddonPayload(player, BuildAddonEntryPayload("BOOTSTRAP_ENTRY", view));
+            PendingBootstrap& pending = itr->second;
+
+            while (budget > 0 && pending.spawnIndex < pending.spawnIds.size())
+            {
+                ObjectGuid::LowType const spawnId = pending.spawnIds[pending.spawnIndex++];
+                --budget;
+
+                NemesisStore::const_iterator nemIt = ActiveNemeses.find(spawnId);
+                if (nemIt == ActiveNemeses.end())
+                    continue;
+
+                NemesisAddonView const view = BuildAddonView(player, spawnId, nemIt->second);
+                SendChunkedAddonPayload(player, BuildAddonEntryPayload("BOOTSTRAP_ENTRY", view));
+            }
+
+            while (budget > 0 && pending.tempIndex < pending.tempGuids.size())
+            {
+                ObjectGuid const tempGuid = pending.tempGuids[pending.tempIndex++];
+                --budget;
+
+                TemporaryNemesisStore::const_iterator tempIt = ActiveTemporaryNemeses.find(tempGuid);
+                if (tempIt == ActiveTemporaryNemeses.end())
+                    continue;
+
+                Creature* creature = ObjectAccessor::GetCreature(*player, tempGuid);
+                if (!creature || !creature->IsAlive())
+                    continue;
+
+                NemesisAddonView const view = BuildAddonView(player, creature->GetSpawnId(), tempIt->second);
+                SendChunkedAddonPayload(player, BuildAddonEntryPayload("BOOTSTRAP_ENTRY", view));
+            }
+
+            bool const done = pending.spawnIndex >= pending.spawnIds.size()
+                && pending.tempIndex >= pending.tempGuids.size();
+            if (done)
+            {
+                SendAddonPayload(player, "V2:BOOTSTRAP_END");
+                itr = PendingBootstraps.erase(itr);
+            }
+            else
+                ++itr;
         }
-
-        for (auto const& [creature, state] : mapTemps)
-        {
-            NemesisAddonView const view = BuildAddonView(player, creature->GetSpawnId(), state);
-            SendChunkedAddonPayload(player, BuildAddonEntryPayload("BOOTSTRAP_ENTRY", view));
-        }
-
-        SendAddonPayload(player, "V2:BOOTSTRAP_END");
     }
 
     void SendValidatedNemesisUpsert(Player* player, ObjectGuid::LowType spawnId, NemesisState const& state)
@@ -5869,6 +5971,12 @@ public:
 
     void OnUpdate(uint32 diff) override
     {
+        // Drain any in-flight `.nemesis addon bootstrap/sync` queues every
+        // tick (perf pacing — see ProcessPendingBootstraps()). Unconditional
+        // and independent of the ambient-generation timer below: it's a
+        // no-op (single empty-map check) whenever nothing is queued.
+        ProcessPendingBootstraps();
+
         // Config is read only when the timer fires (plus one roll at startup).
         // A per-world-tick GetOption would hammer the config map and spam
         // "Missing property" warnings when a key is absent from the .conf.

@@ -25,6 +25,12 @@ NT.data = NT.data or {
     bootstrapExpected = 0,
     bootstrapActive = false,
     lastSyncAt = 0,
+    -- Perf: dedicated "when did WE last ask the server for a full
+    -- bootstrap" timestamp, separate from lastSyncAt (which also gets
+    -- bumped by unrelated peer-to-peer addon syncs). Used by
+    -- RequestBootstrap()'s cooldown guard. See NemesisSystem.cpp
+    -- ProcessPendingBootstraps for why this matters server-side too.
+    lastBootstrapRequestAt = 0,
     lastServerTime = 0,
     connectionState = "idle",
     currentFilter = "all",
@@ -857,13 +863,58 @@ function NT:HandleSystemMessage(message)
     self:ParseServerPayload(string.sub(message, string.len(prefix) + 1))
 end
 
-function NT:RequestBootstrap()
+-- Perf: a full `.nemesis addon bootstrap` walks every active nemesis
+-- world-wide server-side (paced across ticks server-side, but still real
+-- work) — it should not be re-sent on every zone change / chat line /
+-- auto-sync tick. This guard skips re-requesting when a bootstrap is
+-- already in flight (bootstrapActive, set once BOOTSTRAP_BEGIN comes back)
+-- or was requested less than BOOTSTRAP_COOLDOWN_SECONDS ago.
+-- `force=true` bypasses the guard entirely — used only for
+-- PLAYER_ENTERING_WORLD (login/reload/loading screen) so a cold client is
+-- guaranteed a full bootstrap regardless of any leftover state.
+local BOOTSTRAP_COOLDOWN_SECONDS = 45
+
+function NT:RequestBootstrap(force)
+    local now = self:GetNow()
+
+    if not force then
+        if self.data.bootstrapActive then
+            return
+        end
+        local lastRequest = self.data.lastBootstrapRequestAt or 0
+        if lastRequest > 0 and (now - lastRequest) < BOOTSTRAP_COOLDOWN_SECONDS then
+            return
+        end
+    end
+
+    self.data.lastBootstrapRequestAt = now
     self.data.connectionState = "requesting"
-    self.data.lastSyncAt = self:GetNow()
+    self.data.lastSyncAt = now
     if self.UI then
         self.UI:RefreshStatus()
     end
     self:SendServerCommand(".nemesis addon bootstrap")
+end
+
+-- Perf: coalesces the chat-keyword bootstrap trigger (below, in
+-- CHAT_MSG_SYSTEM) into at most one pending call at a time. Before this,
+-- EVERY matching chat line scheduled its own independent 2s timer with no
+-- cancellation of prior ones — a burst of bot-combat chat containing
+-- "ранг"/"обрёл"/etc. could queue up many overlapping RequestBootstrap()
+-- calls in a few seconds. Now a burst collapses to a single deferred call,
+-- which RequestBootstrap()'s own cooldown guard (above) then further caps
+-- to at most once per BOOTSTRAP_COOLDOWN_SECONDS.
+local pendingChatBootstrap = false
+
+local function ScheduleChatTriggeredBootstrap()
+    if pendingChatBootstrap then
+        return
+    end
+    pendingChatBootstrap = true
+    NT:ScheduleTimer(function()
+        pendingChatBootstrap = false
+        NT:RequestBootstrap()
+    end, 2)
 end
 
 function NT:RequestSync()
@@ -1168,7 +1219,11 @@ function NT:PLAYER_ENTERING_WORLD()
     end
     self:ScheduleTimer(function()
         if self.db.autoBootstrap then
-            self:RequestBootstrap()
+            -- Forced: a loading screen (login/reload/teleport/instance
+            -- enter) is exactly when stale/missing data is most likely, and
+            -- this event is inherently infrequent — not the spam vector the
+            -- cooldown guard exists for. See RequestBootstrap().
+            self:RequestBootstrap(true)
         end
         if self.db.autoPeerSync then
             self:RequestPeerSync()
@@ -1366,9 +1421,7 @@ function NT:CHAT_MSG_SYSTEM(_, message)
         or string.find(message, "обрел", 1, true)
         or string.find(message, "стал(а)", 1, true)
         or string.find(message, "присутствие", 1, true)) then
-        self:ScheduleTimer(function()
-            self:RequestBootstrap()
-        end, 2)
+        ScheduleChatTriggeredBootstrap()
     end
 end
 
