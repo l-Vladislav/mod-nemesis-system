@@ -14,13 +14,16 @@
 #include "GuildMgr.h"
 #include "Map.h"
 #include "MapMgr.h"
+#include "ObjectAccessor.h"
 #include "ObjectGuid.h"
 #include "ObjectMgr.h"
+#include "TemporarySummon.h"
 #include "Mail.h"
 #include "Player.h"
 #include "Random.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
+#include "SpellMgr.h"
 #include "UnitScript.h"
 #include "WorldPacket.h"
 #include "World.h"
@@ -66,6 +69,7 @@ namespace NemesisReputation
     bool   AddPoints(Player* player, uint32 amount);
     uint32 GetPoints(Player* player);
     uint8  GetRank(Player* player);
+    uint32 GetThreshold(uint8 rank);
     void   OnLogin(Player* player);
     void   OnLogout(Player* player);
 }
@@ -141,6 +145,8 @@ namespace
         uint32 repPoints  = 0;
         uint8  repRank    = 1;
         uint32 expiresAt  = 0;  // active bounty's expiry (0 if not this player's bounty)
+        uint32 repTierFloor = 0; // rep points at the current rank's floor
+        uint32 repTierNext  = 0; // rep points to reach the next rank (0 = max rank)
     };
 
     // Nemesis title generator — deterministic from spawnId + creatureEntry
@@ -355,7 +361,33 @@ namespace
     NemesisTickStore RegenTickAccumulators;
     TemporaryNemesisStore ActiveTemporaryNemeses;
     TemporaryNemesisTickStore TemporaryRegenTickAccumulators;
+    // Dungeon instanceIds that have seen a real player (or any player when
+    // RequireRealPlayers=0). Marked + swept on map enter, erased on map
+    // destroy. Needed because Map::AddPlayerToMap loads visibility-range
+    // grids BEFORE the player lands in the map's player list — spawn-time
+    // player checks see an empty map.
+    std::unordered_set<uint32> RealDungeonInstances;
+    // instanceId -> last presence-message timestamp, to debounce the dungeon
+    // "you sense a strong enemy" line (individual deep-dungeon spawns would
+    // otherwise each emit one).
+    std::unordered_map<uint32, uint32> LastDungeonPresenceTs;
     bool CacheLoaded = false;
+
+    // Perf pacing state for SendNemesisBootstrap — see
+    // GetAddonBootstrapEntriesPerTick() and ProcessPendingBootstraps().
+    // spawnIds/tempGuids are the already-computed, already-sorted work list
+    // for one player's in-flight bootstrap; *Index tracks how far the drain
+    // has progressed. tempGuids are ActiveTemporaryNemeses keys, re-resolved
+    // to a live Creature* at drain time (never held across ticks) since the
+    // dungeon creature can legitimately die/despawn mid-drain.
+    struct PendingBootstrap
+    {
+        std::vector<ObjectGuid::LowType> spawnIds;
+        std::vector<ObjectGuid> tempGuids;
+        size_t spawnIndex = 0;
+        size_t tempIndex = 0;
+    };
+    std::unordered_map<ObjectGuid, PendingBootstrap> PendingBootstraps;
 
     constexpr char NEMESIS_ADDON_PREFIX[] = "Nemesis";
     size_t constexpr NEMESIS_ADDON_CHUNK_SIZE = 450;
@@ -507,6 +539,19 @@ namespace
         return std::max<uint32>(1, sConfigMgr->GetOption<uint32>("NemesisSystem.AddonBootstrapMaxEntries", 100));
     }
 
+    // Perf pacing: `.nemesis addon bootstrap/sync` (includeAll=true) can walk
+    // every non-expired ActiveNemeses entry world-wide (ambient generation
+    // keeps most populated zones near MaxPerZone, so this is easily 500-1500+
+    // entries). Building+sending them all synchronously in one command
+    // invocation measured ~190ms of blocked main-thread time on live. This
+    // caps how many entries ProcessPendingBootstraps() may build+send per
+    // world tick (shared across all in-flight players' queues that tick), so
+    // the wire protocol/content is unchanged but the work is spread out.
+    uint32 GetAddonBootstrapEntriesPerTick()
+    {
+        return std::max<uint32>(1, sConfigMgr->GetOption<uint32>("NemesisSystem.AddonBootstrapEntriesPerTick", 50));
+    }
+
     uint32 GetAddonReportCooldownSeconds()
     {
         return sConfigMgr->GetOption<uint32>("NemesisSystem.AddonReportCooldownSeconds", 30);
@@ -557,6 +602,16 @@ namespace
             default:
                 return false;
         }
+    }
+
+    // Hunter's Covenant scaling (owner 2026-06-07): seasoned hunters breed
+    // seasoned foes. Bonus to STARTING rank by reputation rank:
+    // rank 1-2 -> +0, rank 3-4 -> +1, rank 5 -> +2. Clamped to MaxRank.
+    uint8 HunterRankBonus(Player* player)
+    {
+        if (!player || !sConfigMgr->GetOption<bool>("NemesisSystem.HunterRankScaling.Enable", true))
+            return 0;
+        return uint8((NemesisReputation::GetRank(player) - 1) / 2);
     }
 
     float GetScaleMultiplier(uint8 rank)
@@ -742,8 +797,32 @@ namespace
         if (!zoneId)
             return "Unknown";
 
+        // Manual corrections for known typos/gaps in the deployed ruRU
+        // AreaTable.dbc. "ё" is frequently dropped in favor of "е" in
+        // Russian source text (a common typography slip) — this survived
+        // into the localization data we ship. Keyed by zoneId so we only
+        // ever touch strings we've explicitly verified, never guess at
+        // declined/subzone forms. Add further entries here as they're found
+        // rather than special-casing them in addon Lua.
+        static std::unordered_map<uint32, std::string> const zoneNameOverrides =
+        {
+            { 148, "Тёмные берега" }, // Darkshore: DBC has "Темные берега" (missing ё)
+        };
+        if (auto it = zoneNameOverrides.find(zoneId); it != zoneNameOverrides.end())
+            return it->second;
+
         if (AreaTableEntry const* area = sAreaTableStore.LookupEntry(zoneId))
-            return area->area_name[0] ? area->area_name[0] : "Unknown";
+        {
+            // ruRU server: prefer the ruRU string slot explicitly (the
+            // worldserver DBC.Locale is auto/enUS, so GetDefaultDbcLocale()
+            // is useless here); fall back to the server default, then enUS.
+            if (area->area_name[LOCALE_ruRU] && *area->area_name[LOCALE_ruRU])
+                return area->area_name[LOCALE_ruRU];
+            LocaleConstant const loc = sWorld->GetDefaultDbcLocale();
+            if (area->area_name[loc] && *area->area_name[loc])
+                return area->area_name[loc];
+            return area->area_name[0] && *area->area_name[0] ? area->area_name[0] : "Unknown";
+        }
 
         return "Unknown";
     }
@@ -941,6 +1020,10 @@ namespace
         {
             view.repPoints = NemesisReputation::GetPoints(player);
             view.repRank   = NemesisReputation::GetRank(player);
+            // Tier bounds so the client never hardcodes the rank curve.
+            view.repTierFloor = NemesisReputation::GetThreshold(view.repRank);
+            view.repTierNext  = view.repRank >= GetMaxRank()
+                ? 0 : NemesisReputation::GetThreshold(view.repRank + 1);
 
             NemesisBountyBoard::ActiveBounty active;
             if (NemesisBountyBoard::GetActiveBounty(player, active)
@@ -956,7 +1039,7 @@ namespace
     std::string BuildAddonEntryPayload(char const* opcode, NemesisAddonView const& view)
     {
         return Acore::StringFormat(
-            "V2:{}:{}:{}:{}:{}:{}:{}:{:.1f}:{:.1f}:{:.1f}:{:.2f}:{:.2f}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "V2:{}:{}:{}:{}:{}:{}:{}:{:.1f}:{:.1f}:{:.1f}:{:.2f}:{:.2f}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             opcode,
             uint64(view.spawnId),
             view.creatureEntry,
@@ -985,7 +1068,9 @@ namespace
             view.localizedName,
             view.repPoints,
             uint32(view.repRank),
-            view.expiresAt);
+            view.expiresAt,
+            view.repTierFloor,
+            view.repTierNext);
     }
 
     std::string BuildHelloPayload(uint32 entryCount)
@@ -1077,27 +1162,120 @@ namespace
                 callback(player);
     }
 
+    // Queues a player's bootstrap: the spawnId/tempGuid work list is computed
+    // right away (cheap — just map iteration + a sort, no per-entry
+    // formatting/packet work), HELLO + BOOTSTRAP_BEGIN go out immediately so
+    // the addon's progress bar starts, and the actual per-entry
+    // BuildAddonView + SendChunkedAddonPayload work (the expensive part) is
+    // drained a bounded number of entries per world tick by
+    // ProcessPendingBootstraps(). Wire protocol/content is unchanged from
+    // the old fully-synchronous version — only the pacing changed.
     void SendNemesisBootstrap(Player* player, bool includeAll = false)
     {
         if (!player)
             return;
 
-        std::vector<ObjectGuid::LowType> const spawnIds = CollectBootstrapSpawnIds(player, includeAll);
+        std::vector<ObjectGuid::LowType> spawnIds = CollectBootstrapSpawnIds(player, includeAll);
 
-        SendAddonPayload(player, BuildHelloPayload(spawnIds.size()));
-        SendAddonPayload(player, Acore::StringFormat("V2:BOOTSTRAP_BEGIN:{}:{}", spawnIds.size(), uint32(GameTime::GetGameTime().count())));
-
-        for (ObjectGuid::LowType spawnId : spawnIds)
+        // Temporary nemeses of the player's CURRENT map (dungeon nemeses).
+        // They never live in ActiveNemeses; bootstrap is the reliable channel
+        // because creation/enter pushes can race the loading screen. Only the
+        // guid keys are snapshotted here — liveness is re-checked at drain
+        // time in ProcessPendingBootstraps(), since a dungeon creature can
+        // legitimately die/despawn during a multi-tick drain.
+        std::vector<ObjectGuid> tempGuids;
+        for (auto const& [guid, state] : ActiveTemporaryNemeses)
         {
-            NemesisStore::const_iterator itr = ActiveNemeses.find(spawnId);
-            if (itr == ActiveNemeses.end())
+            if (state.mapId != player->GetMapId())
                 continue;
-
-            NemesisAddonView const view = BuildAddonView(player, spawnId, itr->second);
-            SendChunkedAddonPayload(player, BuildAddonEntryPayload("BOOTSTRAP_ENTRY", view));
+            Creature* creature = ObjectAccessor::GetCreature(*player, guid);
+            if (creature && creature->IsAlive())
+                tempGuids.push_back(guid);
         }
 
-        SendAddonPayload(player, "V2:BOOTSTRAP_END");
+        uint32 const total = uint32(spawnIds.size() + tempGuids.size());
+        SendAddonPayload(player, BuildHelloPayload(total));
+        SendAddonPayload(player, Acore::StringFormat("V2:BOOTSTRAP_BEGIN:{}:{}", total, uint32(GameTime::GetGameTime().count())));
+
+        if (spawnIds.empty() && tempGuids.empty())
+        {
+            SendAddonPayload(player, "V2:BOOTSTRAP_END");
+            return;
+        }
+
+        // Re-requesting while a previous bootstrap for this player is still
+        // draining simply restarts the queue (old END is never sent, but
+        // that's harmless — the addon only awaits/uses the most recent one).
+        PendingBootstrap& pending = PendingBootstraps[player->GetGUID()];
+        pending.spawnIds = std::move(spawnIds);
+        pending.tempGuids = std::move(tempGuids);
+        pending.spawnIndex = 0;
+        pending.tempIndex = 0;
+    }
+
+    // Drains queued bootstraps, up to GetAddonBootstrapEntriesPerTick()
+    // entries total *across all players* per call, so one call's added
+    // main-thread cost is bounded regardless of how many bootstraps happen
+    // to be in flight at once. Called every world tick from
+    // NemesisAmbientWorldScript::OnUpdate (cheap no-op when nothing queued).
+    void ProcessPendingBootstraps()
+    {
+        if (PendingBootstraps.empty())
+            return;
+
+        uint32 budget = GetAddonBootstrapEntriesPerTick();
+
+        for (auto itr = PendingBootstraps.begin(); itr != PendingBootstraps.end() && budget > 0;)
+        {
+            Player* player = HashMapHolder<Player>::Find(itr->first);
+            if (!player || !player->GetSession())
+            {
+                itr = PendingBootstraps.erase(itr);
+                continue;
+            }
+
+            PendingBootstrap& pending = itr->second;
+
+            while (budget > 0 && pending.spawnIndex < pending.spawnIds.size())
+            {
+                ObjectGuid::LowType const spawnId = pending.spawnIds[pending.spawnIndex++];
+                --budget;
+
+                NemesisStore::const_iterator nemIt = ActiveNemeses.find(spawnId);
+                if (nemIt == ActiveNemeses.end())
+                    continue;
+
+                NemesisAddonView const view = BuildAddonView(player, spawnId, nemIt->second);
+                SendChunkedAddonPayload(player, BuildAddonEntryPayload("BOOTSTRAP_ENTRY", view));
+            }
+
+            while (budget > 0 && pending.tempIndex < pending.tempGuids.size())
+            {
+                ObjectGuid const tempGuid = pending.tempGuids[pending.tempIndex++];
+                --budget;
+
+                TemporaryNemesisStore::const_iterator tempIt = ActiveTemporaryNemeses.find(tempGuid);
+                if (tempIt == ActiveTemporaryNemeses.end())
+                    continue;
+
+                Creature* creature = ObjectAccessor::GetCreature(*player, tempGuid);
+                if (!creature || !creature->IsAlive())
+                    continue;
+
+                NemesisAddonView const view = BuildAddonView(player, creature->GetSpawnId(), tempIt->second);
+                SendChunkedAddonPayload(player, BuildAddonEntryPayload("BOOTSTRAP_ENTRY", view));
+            }
+
+            bool const done = pending.spawnIndex >= pending.spawnIds.size()
+                && pending.tempIndex >= pending.tempGuids.size();
+            if (done)
+            {
+                SendAddonPayload(player, "V2:BOOTSTRAP_END");
+                itr = PendingBootstraps.erase(itr);
+            }
+            else
+                ++itr;
+        }
     }
 
     void SendValidatedNemesisUpsert(Player* player, ObjectGuid::LowType spawnId, NemesisState const& state)
@@ -1378,15 +1556,20 @@ namespace
         if (!creature)
             return false;
 
+        // Temporary store FIRST: dungeon nemeses are temp-keyed by ObjectGuid
+        // even though their creatures carry spawnIds (spawnIds collide across
+        // instances of the same dungeon and must never reach the DB path).
+        TemporaryNemesisStore::iterator itr = ActiveTemporaryNemeses.find(creature->GetGUID());
+        if (itr != ActiveTemporaryNemeses.end())
+        {
+            state = itr->second;
+            return true;
+        }
+
         if (ObjectGuid::LowType const spawnId = creature->GetSpawnId())
             return TryGetNemesisState(spawnId, state);
 
-        TemporaryNemesisStore::iterator itr = ActiveTemporaryNemeses.find(creature->GetGUID());
-        if (itr == ActiveTemporaryNemeses.end())
-            return false;
-
-        state = itr->second;
-        return true;
+        return false;
     }
 
     // Save a nemesis state. Normally the DB key is creature->GetSpawnId(),
@@ -1491,13 +1674,20 @@ namespace  // reopen anon ns
         if (!creature)
             return;
 
+        // Temp entry first (dungeon nemeses have spawnIds but live temp-only).
+        if (ActiveTemporaryNemeses.erase(creature->GetGUID()))
+        {
+            TemporaryRegenTickAccumulators.erase(creature->GetGUID());
+            (void)reason;
+            return;
+        }
+
         if (ObjectGuid::LowType const spawnId = creature->GetSpawnId())
         {
             DeleteNemesisState(spawnId, reason);
             return;
         }
 
-        ActiveTemporaryNemeses.erase(creature->GetGUID());
         TemporaryRegenTickAccumulators.erase(creature->GetGUID());
         (void)reason;
     }
@@ -1507,23 +1697,25 @@ namespace  // reopen anon ns
         if (!creature)
             return;
 
+        TemporaryRegenTickAccumulators.erase(creature->GetGUID());
         if (ObjectGuid::LowType const spawnId = creature->GetSpawnId())
             RegenTickAccumulators.erase(spawnId);
-        else
-            TemporaryRegenTickAccumulators.erase(creature->GetGUID());
     }
 
     uint32& GetRegenAccumulator(Creature* creature)
     {
-        if (ObjectGuid::LowType const spawnId = creature->GetSpawnId())
-            return RegenTickAccumulators[spawnId];
+        // Temp-resident creatures (City Siege summons, dungeon nemeses) tick
+        // on the guid-keyed accumulator even when they carry a spawnId.
+        if (!creature->GetSpawnId() || ActiveTemporaryNemeses.count(creature->GetGUID()))
+            return TemporaryRegenTickAccumulators[creature->GetGUID()];
 
-        return TemporaryRegenTickAccumulators[creature->GetGUID()];
+        return RegenTickAccumulators[creature->GetSpawnId()];
     }
 
     void BroadcastRankFiveNemesisIfPersistent(Creature* creature, NemesisState const& state)
     {
-        if (!creature || !creature->GetSpawnId())
+        // Temps (incl. dungeon nemeses with spawnIds) never broadcast rank 5.
+        if (!creature || !creature->GetSpawnId() || ActiveTemporaryNemeses.count(creature->GetGUID()))
             return;
 
         BroadcastRankFiveNemesis(creature->GetSpawnId(), state);
@@ -1549,7 +1741,7 @@ namespace  // reopen anon ns
         state.baseAttackTime = killer->GetCreatureTemplate()->BaseAttackTime;
         state.baseRangeAttackTime = killer->GetCreatureTemplate()->RangeAttackTime;
         state.baseRunSpeedRate = killer->GetSpeedRate(MOVE_RUN);
-        state.targetGuid = killed->GetGUID().GetCounter();
+        state.targetGuid = killed ? killed->GetGUID().GetCounter() : 0;  // 0 = ambient-born, no victim
         state.createdAt = uint32(GameTime::GetGameTime().count());
         state.lastSeenAt = state.createdAt;
         return state;
@@ -1774,7 +1966,7 @@ namespace  // reopen anon ns
         {
             CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
             item->SaveToDB(trans);
-            MailDraft("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0] Reward", "Your bags were full. Here are your nemesis rewards.")
+            MailDraft("\u041d\u0430\u0433\u0440\u0430\u0434\u0430 \u043e\u0445\u043e\u0442\u043d\u0438\u043a\u0430", "Your bags were full. Here are your nemesis rewards.")
                 .AddItem(item)
                 .SendMailTo(trans,
                     MailReceiver(player, player->GetGUID().GetCounter()),
@@ -2010,7 +2202,11 @@ namespace  // reopen anon ns
                 ++state.rank;
         }
         else
+        {
             state = BuildInitialNemesisState(killer, killed);
+            // Seasoned hunters breed seasoned foes.
+            state.rank = std::min<uint8>(GetMaxRank(), uint8(1 + HunterRankBonus(killed)));
+        }
 
         state.creatureEntry = entry;
         state.mapId = killer->GetMapId();
@@ -2039,13 +2235,494 @@ namespace  // reopen anon ns
         if (ShouldAnnounceCreate() && state.rank >= GetAnnounceMinRank())
         {
             bool const reachedRankFive = existed && previousRank < 5 && state.rank >= 5;
-            // [Немезида]: Бесопожар Обжористый достиг ранга 3!
-            // [Немезида]: Бесопожар Обжористый стал(а) немезидой, убив Caraco!
+            // Бесопожар Обжористый достиг ранга 3!
+            // Бесопожар Обжористый стал(а) немезидой, убив Caraco!
             std::string message = existed
-                ? Acore::StringFormat("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} \xD0\xB4\xD0\xBE\xD1\x81\xD1\x82\xD0\xB8\xD0\xB3 \xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3\xD0\xB0 {}!", killer->GetName(), state.rank)
-                : Acore::StringFormat("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} \xD1\x81\xD1\x82\xD0\xB0\xD0\xBB(\xD0\xB0) \xD0\xBD\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xBE\xD0\xB9, \xD1\x83\xD0\xB1\xD0\xB8\xD0\xB2 {}!", killer->GetName(), killed->GetName());
+                ? Acore::StringFormat("{} \xD0\xB4\xD0\xBE\xD1\x81\xD1\x82\xD0\xB8\xD0\xB3 \xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3\xD0\xB0 {}!", killer->GetName(), state.rank)
+                : Acore::StringFormat("{} \u043e\u0431\u0440\u0451\u043b(\u0430) \u043d\u0435\u0432\u0438\u0434\u0430\u043d\u043d\u0443\u044e \u0441\u0438\u043b\u0443, \u0441\u0440\u0430\u0437\u0438\u0432 {}!", killer->GetName(), killed->GetName());
             BroadcastNemesisMessage(killer, message, reachedRankFive);
         }
+    }
+
+    // ========================================================================
+    // Ambient nemesis generation (2026-06-07).
+    // Periodically promotes a random eligible mob in zones occupied by (real)
+    // players while the zone holds fewer nemeses than FillPercent of
+    // NemesisSystem.MaxPerZone. One birth per zone per tick. Births carry
+    // targetGuid=0 (no victim). The same promote path is intended for future
+    // dungeon generation (spawn-on-enter) — keep it map-agnostic.
+    // ========================================================================
+
+    // Birth-announcement flavor by creature_template.type. Seeded pick keeps
+    // repeated logs varied. Gendered endings follow the module's "стал(а)" style.
+    std::string AmbientBirthFlavor(uint32 creatureType, uint32 seed)
+    {
+        static char const* const beastLines[] = {
+            "\u043e\u0434\u0435\u0440\u0436\u0430\u043b(\u0430) \u0432\u0435\u0440\u0445 \u0432 \u0441\u043c\u0435\u0440\u0442\u0435\u043b\u044c\u043d\u043e\u0439 \u0441\u0445\u0432\u0430\u0442\u043a\u0435 \u0438 \u0441\u0442\u0430\u043b(\u0430) \u0433\u0440\u043e\u0437\u043e\u0439 \u044d\u0442\u0438\u0445 \u043c\u0435\u0441\u0442!",
+            "\u0432\u043a\u0443\u0441\u0438\u043b(\u0430) \u043a\u0440\u043e\u0432\u0438 \u0438 \u043e\u0431\u0440\u0451\u043b(\u0430) \u043d\u0435\u0432\u0438\u0434\u0430\u043d\u043d\u0443\u044e \u0441\u0438\u043b\u0443!",
+        };
+        static char const* const dragonLines[] = {
+            "\u043f\u0440\u043e\u0431\u0443\u0434\u0438\u043b(\u0430) \u0434\u0440\u0435\u0432\u043d\u044e\u044e \u043a\u0440\u043e\u0432\u044c \u0438 \u043e\u0431\u0440\u0451\u043b(\u0430) \u0438\u0441\u0442\u0438\u043d\u043d\u0443\u044e \u043c\u043e\u0449\u044c!",
+            "\u0432\u0441\u043f\u043e\u043c\u043d\u0438\u043b(\u0430) \u043c\u043e\u0449\u044c \u043f\u0440\u0435\u0434\u043a\u043e\u0432 \u0438 \u0440\u0430\u0441\u043f\u0440\u0430\u0432\u0438\u043b(\u0430) \u043a\u0440\u044b\u043b\u044c\u044f!",
+        };
+        static char const* const demonLines[] = {
+            "\u043d\u0430\u043f\u0438\u0442\u0430\u043b\u0441\u044f(\u0430\u0441\u044c) \u044d\u043d\u0435\u0440\u0433\u0438\u0435\u0439 \u0421\u043a\u0432\u0435\u0440\u043d\u044b \u0438 \u0432\u044b\u0440\u043e\u0441(\u043b\u0430) \u0432 \u0433\u0440\u043e\u0437\u043d\u043e\u0433\u043e \u0432\u0440\u0430\u0433\u0430!",
+            "\u0437\u0430\u043a\u043b\u044e\u0447\u0438\u043b(\u0430) \u0442\u0451\u043c\u043d\u0443\u044e \u0441\u0434\u0435\u043b\u043a\u0443 \u0438 \u043e\u0431\u0440\u0451\u043b(\u0430) \u0441\u0442\u0440\u0430\u0448\u043d\u0443\u044e \u0441\u0438\u043b\u0443!",
+        };
+        static char const* const elementalLines[] = {
+            "\u043f\u043e\u0433\u043b\u043e\u0442\u0438\u043b(\u0430) \u044f\u0440\u043e\u0441\u0442\u044c \u0441\u0442\u0438\u0445\u0438\u0439 \u0438 \u0432\u044b\u0448\u0435\u043b(\u0448\u043b\u0430) \u0438\u0437 \u0440\u0430\u0432\u043d\u043e\u0432\u0435\u0441\u0438\u044f!",
+            "\u0432\u043e\u0431\u0440\u0430\u043b(\u0430) \u0432 \u0441\u0435\u0431\u044f \u0441\u0438\u043b\u0443 \u0431\u0443\u0440\u0438 \u0438 \u0432\u043e\u0437\u043d\u0451\u0441\u0441\u044f(\u043b\u0430\u0441\u044c) \u043d\u0430\u0434 \u043f\u0440\u043e\u0447\u0438\u043c\u0438!",
+        };
+        static char const* const giantLines[] = {
+            "\u0441\u043e\u043a\u0440\u0443\u0448\u0438\u043b(\u0430) \u0432\u0441\u0435\u0445 \u0441\u043e\u043f\u0435\u0440\u043d\u0438\u043a\u043e\u0432 \u0438 \u0437\u0430\u043c\u0430\u0442\u0435\u0440\u0435\u043b(\u0430)!",
+            "\u043f\u043e\u0434\u043d\u044f\u043b\u0441\u044f(\u0430\u0441\u044c) \u0438\u0437 \u0433\u043b\u0443\u0431\u0438\u043d \u0437\u0435\u043c\u043b\u0438 \u0432\u043e \u0432\u0441\u0435\u0439 \u043c\u043e\u0449\u0438!",
+        };
+        static char const* const undeadLines[] = {
+            "\u043e\u0442\u043a\u0430\u0437\u0430\u043b\u0441\u044f(\u0430\u0441\u044c) \u0443\u0445\u043e\u0434\u0438\u0442\u044c \u0432 \u043d\u0435\u0431\u044b\u0442\u0438\u0435 \u0438 \u043e\u043a\u0440\u0435\u043f(\u043b\u0430) \u0432 \u043f\u0440\u043e\u043a\u043b\u044f\u0442\u0438\u0438!",
+            "\u0432\u043f\u0438\u0442\u0430\u043b(\u0430) \u0441\u0438\u043b\u0443 \u043f\u0440\u043e\u043a\u043b\u044f\u0442\u044b\u0445 \u0437\u0435\u043c\u0435\u043b\u044c \u0438 \u0432\u043e\u0441\u0441\u0442\u0430\u043b(\u0430) \u0433\u0440\u043e\u0437\u043d\u0435\u0435 \u043f\u0440\u0435\u0436\u043d\u0435\u0433\u043e!",
+        };
+        static char const* const humanoidLines[] = {
+            "\u043f\u043e\u0441\u0442\u0438\u0433(\u043b\u0430) \u0437\u0430\u043f\u0440\u0435\u0442\u043d\u044b\u0435 \u0437\u043d\u0430\u043d\u0438\u044f \u0438 \u0441\u0434\u0435\u043b\u0430\u043b\u0441\u044f(\u0430\u0441\u044c) \u043e\u043f\u0430\u0441\u043d\u044b\u043c \u043f\u0440\u043e\u0442\u0438\u0432\u043d\u0438\u043a\u043e\u043c!",
+            "\u043f\u0440\u043e\u0448\u0451\u043b(\u0448\u043b\u0430) \u043f\u0443\u0442\u044c \u043e\u0442 \u0438\u0437\u0433\u043e\u044f \u0434\u043e \u0433\u0440\u043e\u0437\u044b \u044d\u0442\u0438\u0445 \u0437\u0435\u043c\u0435\u043b\u044c!",
+        };
+        static char const* const mechanicalLines[] = {
+            "\u043f\u0435\u0440\u0435\u043d\u0430\u0441\u0442\u0440\u043e\u0438\u043b(\u0430) \u0441\u0432\u043e\u0438 \u043f\u0440\u043e\u0442\u043e\u043a\u043e\u043b\u044b \u043d\u0430 \u0443\u043d\u0438\u0447\u0442\u043e\u0436\u0435\u043d\u0438\u0435 \u0432\u0441\u0435\u0433\u043e \u0436\u0438\u0432\u043e\u0433\u043e!",
+            "\u0432\u044b\u0448\u0435\u043b(\u0448\u043b\u0430) \u0438\u0437-\u043f\u043e\u0434 \u043a\u043e\u043d\u0442\u0440\u043e\u043b\u044f \u0441\u0432\u043e\u0438\u0445 \u0441\u043e\u0437\u0434\u0430\u0442\u0435\u043b\u0435\u0439!",
+        };
+        static char const* const defaultLines[] = {
+            "\u043e\u0431\u0440\u0451\u043b(\u0430) \u043d\u0435\u0432\u0438\u0434\u0430\u043d\u043d\u0443\u044e \u0441\u0438\u043b\u0443 \u0438 \u0436\u0430\u0436\u0434\u0435\u0442 \u043a\u0440\u043e\u0432\u0438!",
+        };
+
+        char const* const* lines = defaultLines;
+        uint32 count = 1;
+        switch (creatureType)
+        {
+            case CREATURE_TYPE_BEAST:      lines = beastLines;      count = 2; break;
+            case CREATURE_TYPE_DRAGONKIN:  lines = dragonLines;     count = 2; break;
+            case CREATURE_TYPE_DEMON:      lines = demonLines;      count = 2; break;
+            case CREATURE_TYPE_ELEMENTAL:  lines = elementalLines;  count = 2; break;
+            case CREATURE_TYPE_GIANT:      lines = giantLines;      count = 2; break;
+            case CREATURE_TYPE_UNDEAD:     lines = undeadLines;     count = 2; break;
+            case CREATURE_TYPE_HUMANOID:   lines = humanoidLines;   count = 2; break;
+            case CREATURE_TYPE_MECHANICAL: lines = mechanicalLines; count = 2; break;
+            default: break;
+        }
+        return lines[seed % count];
+    }
+
+    // Owner 2026-06-12: a regular player must be able to reach and attack
+    // the creature. Event-phase spawns (DK chain at Light's Hope) are
+    // invisible outside their phase; floating WMOs (EPL necropolises) sit
+    // hundreds of yards above the terrain and have no walkable entrance.
+    bool IsAccessibleWorldTarget(Creature* creature)
+    {
+        if (!(creature->GetPhaseMask() & PHASEMASK_NORMAL))
+            return false;
+
+        float const ground = creature->GetMap()->GetGridHeight(
+            creature->GetPositionX(), creature->GetPositionY());
+        if (ground > INVALID_HEIGHT && creature->GetPositionZ() - ground > 50.0f)
+            return false;
+
+        return true;
+    }
+
+    bool IsEligibleAmbientCandidate(Creature* creature)
+    {
+        if (!creature || !creature->IsInWorld() || !creature->IsAlive() || !creature->GetSpawnId())
+            return false;
+
+        if (creature->IsPet() || creature->IsCritter() || creature->IsTotem() || creature->IsTrigger())
+            return false;
+
+        if (!IsAccessibleWorldTarget(creature))
+            return false;
+
+        // Friendly/service NPCs never become ambient nemeses.
+        CreatureTemplate const* tmpl = creature->GetCreatureTemplate();
+        if (!tmpl || tmpl->npcflag != 0 || creature->IsCivilian())
+            return false;
+
+        if (!creature->IsHostileToPlayers())
+            return false;
+
+        if (!IsAllowedCreatureRank(tmpl->rank))
+            return false;
+
+        // Rares are pool-driven (entry-keyed dedup against player targets) —
+        // ambient births with targetGuid=0 would fracture that; skip them.
+        if (IsRareEntry(creature->GetEntry()))
+            return false;
+
+        if (creature->IsDungeonBoss() || creature->isWorldBoss())
+            return false;
+
+        uint8 const level = creature->GetLevel();
+        if (level < GetMinCreatureLevel() || level > GetMaxCreatureLevel())
+            return false;
+
+        NemesisState existing;
+        if (TryGetNemesisState(creature, existing))
+            return false;
+
+        return true;
+    }
+
+    // Push a fresh/updated nemesis to the addon of every player in its zone
+    // (chat-trigger bootstrap is unreliable with the RP birth flavors).
+    void PushNemesisToZone(Creature* creature, NemesisState const& state)
+    {
+        if (!creature->GetSpawnId())
+            return;
+        uint32 const zoneId = creature->GetZoneId();
+        Map::PlayerList const& players = creature->GetMap()->GetPlayers();
+        for (auto itr = players.begin(); itr != players.end(); ++itr)
+            if (Player* player = itr->GetSource())
+                if (player->GetZoneId() == zoneId && player->GetSession())
+                    SendValidatedNemesisUpsert(player, creature->GetSpawnId(), state);
+    }
+
+    // Ambient announcements: zone-local by default, server-wide otherwise.
+    void AnnounceAmbient(Creature* creature, std::string const& message)
+    {
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.Announce", true))
+            return;
+
+        if (sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.AnnounceZoneOnly", true))
+        {
+            uint32 const zoneId = creature->GetZoneId();
+            Map::PlayerList const& players = creature->GetMap()->GetPlayers();
+            for (auto itr = players.begin(); itr != players.end(); ++itr)
+                if (Player* player = itr->GetSource())
+                    if (player->GetZoneId() == zoneId && player->GetSession())
+                        ChatHandler(player->GetSession()).SendSysMessage(message);
+        }
+        else
+            BroadcastNemesisMessage(creature, message, false);
+    }
+
+    // Victimless promotion. Mirrors PromoteNemesis minus rare dedup (rares are
+    // filtered out by eligibility) and the victim-bound addon push.
+    void PromoteAmbientNemesis(Creature* creature, bool announce = true, uint8 bonusRank = 0)
+    {
+        uint32 const now = uint32(GameTime::GetGameTime().count());
+
+        NemesisState state = BuildInitialNemesisState(creature, nullptr);
+        state.rank = std::min<uint8>(GetMaxRank(), uint8(1 + bonusRank));  // hunter-rank scaling
+        state.lastPromotionAt = now;
+        RollAffixes(state);
+
+        SaveNemesisState(creature, state, 0);
+        ApplyNemesisState(creature, state);
+        creature->SetFullHealth();
+        PushNemesisToZone(creature, state);  // addon sees it immediately
+
+        // GetName() already returns the generated nemesis title here -
+        // ApplyNemesisState ran above.
+        if (announce)
+            AnnounceAmbient(creature, Acore::StringFormat("{} {}",
+                creature->GetName(), AmbientBirthFlavor(creature->GetCreatureTemplate()->type, uint32(creature->GetSpawnId()))));
+    }
+
+    // Ambient rank-up: an existing zone nemesis grows stronger instead of a
+    // new one being born (RankUpChance). Mirrors the rank-up branch of
+    // PromoteNemesis; honors the regular rank-up cooldown.
+    bool AmbientRankUpNemesis(Creature* creature)
+    {
+        NemesisState state;
+        if (!TryGetNemesisState(creature, state))
+            return false;
+        if (state.rank >= GetMaxRank() || GetRankUpCooldownRemaining(state) > 0)
+            return false;
+
+        uint32 const now = uint32(GameTime::GetGameTime().count());
+        ++state.rank;
+        state.lastPromotionAt = now;
+        state.lastSeenAt = now;
+        RollAffixes(state);
+
+        SaveNemesisState(creature, state, 0);
+        ApplyNemesisState(creature, state);
+        creature->SetFullHealth();
+        PushNemesisToZone(creature, state);
+        BroadcastRankFiveNemesisIfPersistent(creature, state);
+
+        // "...набирает силу и достигает ранга N!"
+        AnnounceAmbient(creature, Acore::StringFormat("{} \u043d\u0430\u0431\u0438\u0440\u0430\u0435\u0442 \u0441\u0438\u043b\u0443 \u0438 \u0434\u043e\u0441\u0442\u0438\u0433\u0430\u0435\u0442 \u0440\u0430\u043d\u0433\u0430 {}!",
+            creature->GetName(), state.rank));
+        return true;
+    }
+
+    // One generation pass. With RankUpChance percent, a zone's action becomes
+    // a rank-up of an existing live nemesis instead of a new birth (falls
+    // back to a birth when no rank-up candidate exists). Also callable from
+    // the .nemesis ambient admin command for deterministic testing.
+    void RunAmbientGenerationTick(uint32& births, uint32& rankUps)
+    {
+        births = 0;
+        rankUps = 0;
+
+        uint32 const maxPerZone = GetMaxPerZone();
+        if (!maxPerZone)
+            return;  // ambient refill needs a finite per-zone cap
+
+        uint32 const fillPercent = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NemesisSystem.AmbientGeneration.FillPercent", 50));
+        uint32 const fillTarget = maxPerZone * fillPercent / 100;
+        if (!fillTarget)
+            return;
+
+        bool const realOnly = sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.RequireRealPlayers", true);
+
+        // Open-world zones currently holding qualifying players, per map.
+        // zoneBonus: best hunter-rank bonus among the zone's players - the
+        // zone's ambient births start at 1 + bonus.
+        std::unordered_map<Map*, std::vector<uint32>> zonesByMap;
+        std::unordered_map<uint32, uint8> zoneBonus;
+        ForEachOnlinePlayer([&](Player* player)
+        {
+            if (!player->IsInWorld())
+                return;
+            if (realOnly && IsPlayerbotVictim(player))
+                return;
+            Map* map = player->GetMap();
+            if (!map || map->IsDungeon() || map->IsBattlegroundOrArena() || map->IsRaid())
+                return;
+            std::vector<uint32>& zones = zonesByMap[map];
+            if (std::find(zones.begin(), zones.end(), player->GetZoneId()) == zones.end())
+                zones.push_back(player->GetZoneId());
+            uint8& bonus = zoneBonus[player->GetZoneId()];
+            bonus = std::max(bonus, HunterRankBonus(player));
+        });
+
+        uint32 const rankUpChance = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NemesisSystem.AmbientGeneration.RankUpChance", 10));
+
+        // Per-zone reservoirs: a fresh-birth candidate and a rank-up candidate
+        // (an existing live nemesis off its rank-up cooldown).
+        struct AmbientSlot
+        {
+            Creature* birth = nullptr;
+            uint32 birthSeen = 0;
+            Creature* eliteBirth = nullptr;   // elite-feeding for continent-hunt targets
+            uint32 eliteSeen = 0;
+            Creature* rankUp = nullptr;
+            uint32 rankUpSeen = 0;
+        };
+
+        for (auto const& [map, zones] : zonesByMap)
+        {
+            // Zones still below the fill target get a slot.
+            std::unordered_map<uint32, AmbientSlot> picks;
+            for (uint32 zoneId : zones)
+                if (CountNemesesInZone(zoneId) < fillTarget)
+                    picks.emplace(zoneId, AmbientSlot());
+            if (picks.empty())
+                continue;
+
+            // Single pass over the map's spawned creatures. Grids are loaded
+            // around ALL characters (playerbots included), so the candidate
+            // pool spans the whole inhabited zone — not just the real
+            // player's surroundings. Reservoir-sample one candidate per zone.
+            for (auto const& pair : map->GetCreatureBySpawnIdStore())
+            {
+                Creature* candidate = pair.second;
+                if (!candidate)
+                    continue;
+                auto it = picks.find(candidate->GetZoneId());
+                if (it == picks.end())
+                    continue;
+
+                NemesisState st;
+                if (TryGetNemesisState(candidate, st))
+                {
+                    // Existing nemesis → rank-up reservoir (skip rares: their
+                    // state rows are keyed to player targets).
+                    if (candidate->IsAlive() && st.rank < GetMaxRank()
+                        && !IsRareEntry(candidate->GetEntry())
+                        && GetRankUpCooldownRemaining(st) == 0)
+                    {
+                        ++it->second.rankUpSeen;
+                        if (urand(1, it->second.rankUpSeen) == 1)
+                            it->second.rankUp = candidate;
+                    }
+                    continue;
+                }
+
+                if (!IsEligibleAmbientCandidate(candidate))
+                    continue;
+                ++it->second.birthSeen;
+                if (urand(1, it->second.birthSeen) == 1)
+                    it->second.birth = candidate;
+                uint32 const crank = candidate->GetCreatureTemplate()->rank;
+                if (crank == CREATURE_ELITE_ELITE || crank == CREATURE_ELITE_RAREELITE)
+                {
+                    ++it->second.eliteSeen;
+                    if (urand(1, it->second.eliteSeen) == 1)
+                        it->second.eliteBirth = candidate;
+                }
+            }
+
+            for (auto& [zoneId, slot] : picks)
+            {
+                bool const wantRankUp = rankUpChance && urand(1, 100) <= rankUpChance;
+                if (wantRankUp && slot.rankUp && AmbientRankUpNemesis(slot.rankUp))
+                {
+                    ++rankUps;
+                    continue;
+                }
+                if (slot.birth)
+                {
+                    // Elite feeding (owner 2026-06-07): with EliteChance the
+                    // birth prefers an elite candidate so continent-hunt
+                    // targets actually exist in the world.
+                    Creature* pick = slot.birth;
+                    uint32 const eliteChance = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NemesisSystem.AmbientGeneration.EliteChance", 25));
+                    if (slot.eliteBirth && eliteChance && urand(1, 100) <= eliteChance)
+                        pick = slot.eliteBirth;
+                    PromoteAmbientNemesis(pick, true, zoneBonus[zoneId]);
+                    ++births;
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Dungeon nemesis generation (2026-06-07). Creatures spawning in dungeon
+    // maps roll a small chance to become a TEMPORARY nemesis with a weighted
+    // random rank. Temp-keyed by ObjectGuid, NEVER persisted (spawnIds repeat
+    // across instances of the same dungeon). Dies with the instance.
+    // ========================================================================
+
+    uint8 RollDungeonNemesisRank()
+    {
+        // 50/30/15/4/1 toward low ranks, clipped to the configured MaxRank.
+        static uint8 const weights[5] = { 50, 30, 15, 4, 1 };
+        uint8 const maxRank = std::min<uint8>(5, GetMaxRank());
+        uint32 total = 0;
+        for (uint8 i = 0; i < maxRank; ++i)
+            total += weights[i];
+        uint32 roll = urand(1, total);
+        for (uint8 i = 0; i < maxRank; ++i)
+        {
+            if (roll <= weights[i])
+                return i + 1;
+            roll -= weights[i];
+        }
+        return 1;
+    }
+
+    bool MapHasRealPlayer(Map* map)
+    {
+        Map::PlayerList const& players = map->GetPlayers();
+        for (auto itr = players.begin(); itr != players.end(); ++itr)
+            if (Player* player = itr->GetSource())
+                if (!IsPlayerbotVictim(player))
+                    return true;
+        return false;
+    }
+
+    void AnnounceToMap(Map* map, std::string const& message)
+    {
+        Map::PlayerList const& players = map->GetPlayers();
+        for (auto itr = players.begin(); itr != players.end(); ++itr)
+            if (Player* player = itr->GetSource())
+                if (player->GetSession())
+                    ChatHandler(player->GetSession()).SendSysMessage(message);
+    }
+
+    // Single atmospheric dungeon announcement (owner 2026-06-07): no names,
+    // no ranks - the group just senses the danger. Map-local + debounced per
+    // instance so trickle spawns deeper in the dungeon don't spam the line.
+    void AnnounceDungeonPresence(Map* map)
+    {
+        uint32 const now = uint32(GameTime::GetGameTime().count());
+        uint32 const cooldown = sConfigMgr->GetOption<uint32>("NemesisSystem.DungeonNemesis.PresenceCooldownSeconds", 120);
+        uint32& last = LastDungeonPresenceTs[map->GetInstanceId()];
+        if (last && now - last < cooldown)
+            return;
+        last = now;
+        AnnounceToMap(map, "\u0412\u044b \u0447\u0443\u0432\u0441\u0442\u0432\u0443\u0435\u0442\u0435 \u043f\u0440\u0438\u0441\u0443\u0442\u0441\u0442\u0432\u0438\u0435 \u0441\u0438\u043b\u044c\u043d\u043e\u0433\u043e \u0432\u0440\u0430\u0433\u0430 \u0432 \u044d\u0442\u043e\u043c \u043c\u0435\u0441\u0442\u0435.");
+    }
+
+    // Returns true when the creature became a dungeon nemesis. Pass
+    // announce=false from the map-enter sweep, which sends ONE presence
+    // message for the whole batch instead of one per birth.
+    bool TryRollDungeonNemesis(Creature* creature, bool announce = true)
+    {
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
+            return false;
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.Enable", true))
+            return false;
+
+        Map* map = creature->GetMap();
+        if (!map || !map->IsDungeon() || map->IsBattlegroundOrArena())
+            return false;
+        if (map->IsRaid() && !sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.IncludeRaids", false))
+            return false;
+
+        // Trash and elites only - bosses keep their scripted encounters.
+        if (!creature->IsAlive() || creature->IsPet() || creature->IsCritter()
+            || creature->IsTotem() || creature->IsTrigger())
+            return false;
+        CreatureTemplate const* tmpl = creature->GetCreatureTemplate();
+        if (!tmpl || tmpl->npcflag != 0 || creature->IsCivilian())
+            return false;
+        if (tmpl->rank != CREATURE_ELITE_NORMAL && tmpl->rank != CREATURE_ELITE_ELITE)
+            return false;
+        if (creature->IsDungeonBoss() || creature->isWorldBoss())
+            return false;
+        if (!creature->IsHostileToPlayers())
+            return false;
+
+        // Guard for the map-enter sweep path (the OnCreatureAddWorld path
+        // already checked): never re-roll an existing nemesis.
+        NemesisState existing;
+        if (TryGetNemesisState(creature, existing))
+            return false;
+
+        // Spawn-time player checks race grid preloading (see
+        // RealDungeonInstances) - accept either the marked instance or a
+        // live real player.
+        if (sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.RequireRealPlayers", true)
+            && !RealDungeonInstances.count(map->GetInstanceId())
+            && !MapHasRealPlayer(map))
+            return false;
+
+        float const chance = sConfigMgr->GetOption<float>("NemesisSystem.DungeonNemesis.Chance", 3.0f);
+        if (chance <= 0.0f || !roll_chance_f(chance))
+            return false;
+
+        NemesisState state = BuildInitialNemesisState(creature, nullptr);
+        state.rank = RollDungeonNemesisRank();
+
+        // Seasoned hunters in the instance breed seasoned foes.
+        {
+            uint8 maxBonus = 0;
+            Map::PlayerList const& mplayers = map->GetPlayers();
+            for (auto itr = mplayers.begin(); itr != mplayers.end(); ++itr)
+                if (Player* p = itr->GetSource())
+                    if (!IsPlayerbotVictim(p))
+                        maxBonus = std::max(maxBonus, HunterRankBonus(p));
+            state.rank = std::min<uint8>(GetMaxRank(), uint8(state.rank + maxBonus));
+        }
+
+        state.lastPromotionAt = state.createdAt;
+        RollAffixes(state);
+
+        // Temp store directly - never SaveNemesisState (DB path).
+        ActiveTemporaryNemeses[creature->GetGUID()] = state;
+        ApplyNemesisState(creature, state);
+        creature->SetFullHealth();
+
+        // Addon: push to everyone already inside this instance; late joiners
+        // are covered by the map-enter hook.
+        Map::PlayerList const& players = map->GetPlayers();
+        for (auto itr = players.begin(); itr != players.end(); ++itr)
+            if (Player* player = itr->GetSource())
+                SendValidatedNemesisUpsert(player, creature->GetSpawnId(), state);
+
+        if (announce)
+            AnnounceDungeonPresence(map);
+        return true;
     }
 }
 
@@ -2056,6 +2733,680 @@ namespace NemesisBountyBoard
     bool CheckCompletion(Player* player, Creature* killed, std::string& outTitle, uint8& outRank);
 }
 
+// ============================================================================
+// Special daily tasks (особые поручения, 2026-06-07). One COMPLETION per day,
+// the day's task choice is final (abandon allowed, re-accept same type only).
+// Reward: 1x «Монета авантюриста» (110150). Types:
+//   SPEED     — kill any nemesis within SpeedKillMinutes of accepting
+//   CONTINENT — kill a non-gray nemesis on the opposite classic continent
+//               (EK <-> Kalimdor; accept only while on map 0/1)
+//   DUNGEON   — kill a (temporary) nemesis inside a dungeon, solo or group
+// ============================================================================
+namespace NemesisSpecialTask
+{
+    enum TaskType : uint8
+    {
+        TASK_NONE      = 0,
+        TASK_SPEED     = 1,
+        TASK_CONTINENT = 2,
+        TASK_DUNGEON   = 3,
+    };
+
+    struct TaskState
+    {
+        uint32 dayStart = 0;
+        uint8  type = TASK_NONE;
+        uint32 acceptedAt = 0;   // 0 while abandoned (type still locks the day)
+        uint32 param = 0;        // CONTINENT: target mapId; DUNGEON: kill counter
+        uint32 targetSpawn = 0;  // named target (speed/continent flavor)
+        bool   completed = false;
+        bool   loaded = false;
+    };
+
+    static std::unordered_map<uint32, TaskState> Cache;
+
+    bool IsEnabled()
+    {
+        return sConfigMgr->GetOption<bool>("NemesisSpecialTask.Enable", true);
+    }
+
+    // PTR-testing toggles (owner 2026-06-07): free type choice + no daily cap.
+    bool FreeChoice()
+    {
+        return sConfigMgr->GetOption<bool>("NemesisSpecialTask.FreeChoice", false);
+    }
+
+    bool NoDailyLimit()
+    {
+        return sConfigMgr->GetOption<bool>("NemesisSpecialTask.NoDailyLimit", false);
+    }
+
+    // "2 ч" / "1 ч 30 мин" / "45 мин" - human time, no raw minute dumps.
+    std::string FormatDuration(uint32 seconds)
+    {
+        uint32 const mins = (seconds + 59) / 60;
+        uint32 const h = mins / 60;
+        uint32 const m = mins % 60;
+        if (!h)
+            return Acore::StringFormat("{} \u043c\u0438\u043d", m);
+        if (!m)
+            return Acore::StringFormat("{} \u0447", h);
+        return Acore::StringFormat("{} \u0447 {} \u043c\u0438\u043d", h, m);
+    }
+
+    // Owner 2026-06-12: world-task targets must be within +-Band levels
+    // of the player (selection AND credit).
+    int32 GetTargetLevelBand()
+    {
+        return int32(sConfigMgr->GetOption<uint32>("NemesisSpecialTask.TargetLevelBand", 3));
+    }
+
+    uint32 GetSpeedLimitSeconds()
+    {
+        return std::max<uint32>(60, sConfigMgr->GetOption<uint32>("NemesisSpecialTask.SpeedKillMinutes", 120) * 60);
+    }
+
+    // Real calendar day aligned to the server's daily-quest reset.
+    uint32 GetDayStart()
+    {
+        uint32 const now = uint32(GameTime::GetGameTime().count());
+        uint32 const next = uint32(sWorld->GetNextDailyQuestsResetTime().count());
+        if (next > now && next - now <= DAY)
+            return next - DAY;
+        return (now / DAY) * DAY;  // fallback: UTC midnight
+    }
+
+    TaskState& Load(Player* player)
+    {
+        uint32 const guidLow = player->GetGUID().GetCounter();
+        TaskState& st = Cache[guidLow];
+        if (!st.loaded)
+        {
+            st.loaded = true;
+            if (QueryResult result = CharacterDatabase.Query(
+                "SELECT `day_start`, `task_type`, `accepted_at`, `param`, `target_spawn`, `completed` "
+                "FROM `character_nemesis_special_task` WHERE `guid` = {}", guidLow))
+            {
+                Field* f = result->Fetch();
+                st.dayStart    = f[0].Get<uint32>();
+                st.type        = f[1].Get<uint8>();
+                st.acceptedAt  = f[2].Get<uint32>();
+                st.param       = f[3].Get<uint32>();
+                st.targetSpawn = f[4].Get<uint32>();
+                st.completed   = f[5].Get<uint8>() != 0;
+            }
+        }
+
+        // New day — the previous row is stale; start fresh.
+        if (st.dayStart != GetDayStart())
+        {
+            st = TaskState();
+            st.loaded = true;
+            st.dayStart = GetDayStart();
+        }
+        return st;
+    }
+
+    void Persist(Player* player, TaskState const& st)
+    {
+        CharacterDatabase.Execute(
+            "REPLACE INTO `character_nemesis_special_task` (`guid`, `day_start`, `task_type`, `accepted_at`, `param`, `target_spawn`, `completed`) "
+            "VALUES ({}, {}, {}, {}, {}, {}, {})",
+            player->GetGUID().GetCounter(), st.dayStart, uint32(st.type), st.acceptedAt, st.param, st.targetSpawn, st.completed ? 1 : 0);
+    }
+
+    void OnLogout(Player* player)
+    {
+        if (player)
+            Cache.erase(player->GetGUID().GetCounter());
+    }
+
+    char const* ContinentName(uint32 mapId)
+    {
+        // "в Восточных королевствах" / "в Калимдоре"
+        return mapId == 0
+            ? "\u0432 \u0412\u043e\u0441\u0442\u043e\u0447\u043d\u044b\u0445 \u043a\u043e\u0440\u043e\u043b\u0435\u0432\u0441\u0442\u0432\u0430\u0445"
+            : "\u0432 \u041a\u0430\u043b\u0438\u043c\u0434\u043e\u0440\u0435";
+    }
+
+    // RP-названия поручений (owner 2026-06-07).
+    char const* TaskName(uint8 type)
+    {
+        switch (type)
+        {
+            case TASK_SPEED:     return "\u0413\u043e\u0440\u044f\u0447\u0438\u0439 \u0441\u043b\u0435\u0434";
+            case TASK_CONTINENT: return "\u0417\u0430\u043c\u043e\u0440\u0441\u043a\u0430\u044f \u043e\u0445\u043e\u0442\u0430";
+            case TASK_DUNGEON:   return "\u041e\u0445\u043e\u0442\u0430 \u0432\u043e \u0442\u044c\u043c\u0435";
+        }
+        return "";
+    }
+
+    uint32 GetDungeonMinKills()
+    {
+        return std::max<uint32>(1, sConfigMgr->GetOption<uint32>("NemesisSpecialTask.DungeonMinKills", 3));
+    }
+
+    // Owner 2026-06-11: the clearing quota grows with the hunter's rank
+    // (base 3 -> 4 -> 5 via the same +0/+1/+2 ladder).
+    uint32 GetDungeonMinKills(Player* player)
+    {
+        return GetDungeonMinKills() + HunterRankBonus(player);
+    }
+
+    // Always 1 coin for now (owner 2026-06-07: few familiars, no other sinks).
+    // Per-type config kept for future tuning.
+    uint32 GetRewardCount(uint8 type)
+    {
+        switch (type)
+        {
+            case TASK_CONTINENT: return sConfigMgr->GetOption<uint32>("NemesisSpecialTask.Reward.Continent", 1);
+            case TASK_DUNGEON:   return sConfigMgr->GetOption<uint32>("NemesisSpecialTask.Reward.Dungeon", 1);
+            default:             return sConfigMgr->GetOption<uint32>("NemesisSpecialTask.Reward.Speed", 1);
+        }
+    }
+
+    // The day's task is ASSIGNED, not chosen (owner 2026-06-07):
+    // deterministic per player per day, like the bounty-pool seeding.
+    uint8 RollDailyType(Player* player)
+    {
+        uint32 const seed = (player->GetGUID().GetCounter() * 2654435761u) ^ GetDayStart();
+        return uint8(1 + (seed % 3));
+    }
+
+    // Offer/condition text for a task type (param-independent).
+    std::string TaskOfferText(uint8 type)
+    {
+        switch (type)
+        {
+            case TASK_SPEED:
+                return Acore::StringFormat("\u041d\u0430\u0441\u0442\u0438\u0433\u043d\u0438 \u0434\u043e\u0431\u044b\u0447\u0443 \u043d\u0430 \u044d\u0442\u043e\u043c \u043a\u043e\u043d\u0442\u0438\u043d\u0435\u043d\u0442\u0435 \u0437\u0430 {}.", FormatDuration(GetSpeedLimitSeconds()));
+            case TASK_CONTINENT:
+                return "\u0421\u0440\u0430\u0437\u0438 \u0433\u0440\u043e\u0437\u043d\u043e\u0433\u043e \u0432\u0440\u0430\u0433\u0430 \u0437\u0430 \u043c\u043e\u0440\u0435\u043c. \u0412 \u043f\u0443\u0442\u044c - \u0438\u0437 \u0412\u043e\u0441\u0442\u043e\u0447\u043d\u044b\u0445 \u043a\u043e\u0440\u043e\u043b\u0435\u0432\u0441\u0442\u0432 \u0438\u043b\u0438 \u041a\u0430\u043b\u0438\u043c\u0434\u043e\u0440\u0430.";
+            case TASK_DUNGEON:
+                return "\u0418\u0441\u0442\u0440\u0435\u0431\u0438 \u0441\u0438\u043b\u044c\u043d\u044b\u0445 \u0447\u0443\u0434\u043e\u0432\u0438\u0449 \u0432 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435, \u043a\u043e\u0442\u043e\u0440\u043e\u0435 \u044f \u0443\u043a\u0430\u0436\u0443.";
+        }
+        return "";
+    }
+
+    bool HasActiveTask(Player* player, uint8 type)
+    {
+        if (!IsEnabled() || !player)
+            return false;
+        TaskState& st = Load(player);
+        return st.type == type && st.acceptedAt && !st.completed;
+    }
+
+    // Display info for the named task target; false when it is gone
+    // (killed/decayed) - callers fall back to generic wording.
+    bool GetTargetDisplay(uint32 targetSpawn, std::string& outTitle, std::string& outZone)
+    {
+        if (!targetSpawn)
+            return false;
+        NemesisState state;
+        if (!TryGetNemesisState(ObjectGuid::LowType(targetSpawn), state))
+            return false;
+        outTitle = GenerateNemesisTitle(targetSpawn, state.creatureEntry);
+        outZone = GetZoneName(state.zoneId);
+        return true;
+    }
+
+    // Random level-appropriate NORMAL dungeon for the clearing task
+    // (LFGDungeons.dbc). Returns its MapID, 0 = none found.
+    uint32 PickTargetDungeonMap(Player* player)
+    {
+        uint32 const level = player->GetLevel();
+        uint32 pick = 0;
+        uint32 seen = 0;
+        for (uint32 i = 0; i < sLFGDungeonStore.GetNumRows(); ++i)
+        {
+            LFGDungeonEntry const* d = sLFGDungeonStore.LookupEntry(i);
+            if (!d || d->TypeID != 1 /*LFG_TYPE_DUNGEON*/ || d->Difficulty != 0)
+                continue;
+            // Hard raid guard regardless of what the LFG row claims:
+            // map_type 1 = MAP_INSTANCE (5-man), raids are 2.
+            MapEntry const* mapEntry = sMapStore.LookupEntry(d->MapID);
+            if (!mapEntry || mapEntry->map_type != 1)
+                continue;
+            // Owner 2026-06-12: dungeon recommended level within +-10
+            // of the player (was: strict MinLevel..MaxLevel band).
+            uint32 const dlevel = d->TargetLevel ? d->TargetLevel : (d->MinLevel + d->MaxLevel) / 2;
+            if (dlevel + 10 < level || dlevel > level + 10)
+                continue;
+            if (player->GetSession() && d->ExpansionLevel > player->GetSession()->Expansion())
+                continue;
+            // Owner 2026-06-12: expansion level gates on top of the +-10
+            // band - TBC dungeons for 62+, WotLK dungeons for 72+ only.
+            if (d->ExpansionLevel == 1 && level <= 61)
+                continue;
+            if (d->ExpansionLevel == 2 && level <= 71)
+                continue;
+            ++seen;
+            if (urand(1, seen) == 1)
+                pick = d->MapID;
+        }
+        return pick;
+    }
+
+    // ruRU-first dungeon name from Map.dbc (the volume's Map.dbc is the
+    // owner's ruRU export; LFGDungeons.dbc is still the enUS set).
+    std::string DungeonName(uint32 mapId)
+    {
+        if (MapEntry const* map = sMapStore.LookupEntry(mapId))
+        {
+            if (map->name[LOCALE_ruRU] && *map->name[LOCALE_ruRU])
+                return map->name[LOCALE_ruRU];
+            if (map->name[0] && *map->name[0])
+                return map->name[0];
+        }
+        return "\u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435";
+    }
+
+    // Does this map belong to the player's active clearing task?
+    bool IsDungeonTaskTarget(Player* player, uint32 mapId)
+    {
+        if (!IsEnabled() || !player)
+            return false;
+        TaskState& st = Load(player);
+        if (st.type != TASK_DUNGEON || !st.acceptedAt || st.completed)
+            return false;
+        return !st.targetSpawn || st.targetSpawn == mapId;
+    }
+
+    // World-task targeting (owner 2026-06-07): the task NAMES a concrete
+    // nemesis. Picks an existing qualifying one (SPEED prefers the player's
+    // zone, then map, then anywhere; CONTINENT - the opposite continent),
+    // otherwise quietly breeds one (no announcement). Returns its spawnId
+    // (0 = nothing found or bred; completion logic does not depend on it).
+    uint32 PickWorldTarget(Player* player, uint8 type, uint32 param)
+    {
+        if (type != TASK_SPEED && type != TASK_CONTINENT)
+            return 0;
+
+        bool const needElite = (type == TASK_CONTINENT);
+        int32 const band = GetTargetLevelBand();
+        int32 const plevel = int32(player->GetLevel());
+
+        // Uniform reservoir over EXISTING nemeses, WORLD-WIDE (owner
+        // 2026-06-11: speed hunts a random non-gray nemesis anywhere, no
+        // zone preference). Template maxlevel is the level proxy for
+        // unloaded ones.
+        Map* baseMap = sMapMgr->FindBaseNonInstanceMap(param);
+        uint32 pickAny = 0;  uint32 seenAny = 0;
+        for (auto const& [spawnId, state] : ActiveNemeses)
+        {
+            // Both tasks hunt on a specific continent (param).
+            if (state.mapId != param)
+                continue;
+            CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(state.creatureEntry);
+            // The whole template band must sit inside player +-Band so any
+            // rolled spawn level is guaranteed to count.
+            if (!tmpl || int32(tmpl->minlevel) < plevel - band || int32(tmpl->maxlevel) > plevel + band)
+                continue;
+            if (needElite && tmpl->rank != CREATURE_ELITE_ELITE
+                && tmpl->rank != CREATURE_ELITE_RAREELITE
+                && tmpl->rank != CREATURE_ELITE_WORLDBOSS)
+                continue;
+            if (!needElite && tmpl->rank != CREATURE_ELITE_NORMAL)
+                continue;  // speed: ordinary prey only
+            // The named target must be reachable for a regular player
+            // (owner 2026-06-12: a task target sat inside a floating
+            // necropolis). Classic births happen wherever bots die, so
+            // verify the live creature; unresolvable spawns (unloaded
+            // grid) are skipped - breeding below guarantees a target.
+            Creature* live = FindLoadedCreatureBySpawnId(baseMap, ObjectGuid::LowType(spawnId));
+            if (!live || !live->IsAlive() || !IsAccessibleWorldTarget(live))
+                continue;
+            // Classic births include faction guards - hostile to one side
+            // only. The accepter must be able to attack the target.
+            if (live->IsFriendlyTo(player))
+                continue;
+            ++seenAny;
+            if (urand(1, seenAny) == 1)
+                pickAny = uint32(spawnId);
+        }
+        if (pickAny)
+            return pickAny;
+
+        // Nothing suitable exists - breed silently.
+        Map* map = nullptr;
+        if (type == TASK_CONTINENT)
+            map = sMapMgr->FindBaseNonInstanceMap(param);
+        else if (player->GetMap() && !player->GetMap()->IsDungeon()
+            && !player->GetMap()->IsBattlegroundOrArena())
+            map = player->GetMap();
+        if (!map)
+            return 0;
+
+        uint32 const playerZone = player->GetZoneId();
+        Creature* zonePick = nullptr; uint32 zoneSeen = 0;
+        Creature* mapPick = nullptr;  uint32 mapSeen = 0;
+        Creature* closest = nullptr;  int32 closestDiff = 0x7FFFFFFF;
+        for (auto const& pair : map->GetCreatureBySpawnIdStore())
+        {
+            Creature* c = pair.second;
+            if (!c || !IsEligibleAmbientCandidate(c))
+                continue;
+            // The accepter must be able to attack the bred target
+            // (faction guards are hostile to one side only).
+            if (c->IsFriendlyTo(player))
+                continue;
+            uint32 const crank = c->GetCreatureTemplate()->rank;
+            if (needElite)
+            {
+                if (crank != CREATURE_ELITE_ELITE && crank != CREATURE_ELITE_RAREELITE)
+                    continue;
+            }
+            else if (crank != CREATURE_ELITE_NORMAL)
+                continue;  // speed: ordinary prey only
+
+            // Last-resort fallback: the closest-level candidate, band or not
+            // (owner 2026-06-12: a target must ALWAYS be born).
+            int32 const diff = std::abs(int32(c->GetLevel()) - plevel);
+            if (diff < closestDiff)
+            {
+                closestDiff = diff;
+                closest = c;
+            }
+            if (diff > band)
+                continue;
+            ++mapSeen;
+            if (urand(1, mapSeen) == 1)
+                mapPick = c;
+            if (type == TASK_SPEED && c->GetZoneId() == playerZone)
+            {
+                ++zoneSeen;
+                if (urand(1, zoneSeen) == 1)
+                    zonePick = c;
+            }
+        }
+
+        Creature* pick = zonePick ? zonePick : (mapPick ? mapPick : closest);
+        if (pick)
+        {
+            PromoteAmbientNemesis(pick, false, HunterRankBonus(player));  // silent, hunter-scaled
+            return uint32(pick->GetSpawnId());
+        }
+        return 0;
+    }
+
+    bool Accept(Player* player, uint8 type, std::string& err)
+    {
+        TaskState& st = Load(player);
+        if (st.completed && !NoDailyLimit())
+        {
+            err = "\u041f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u043d\u0430 \u0441\u0435\u0433\u043e\u0434\u043d\u044f \u0443\u0436\u0435 \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d\u043e.";
+            return false;
+        }
+        if (!FreeChoice() && type != RollDailyType(player))
+        {
+            err = "\u0421\u0435\u0433\u043e\u0434\u043d\u044f \u0441\u0443\u0434\u044c\u0431\u0430 \u043d\u0430\u0437\u043d\u0430\u0447\u0438\u043b\u0430 \u0438\u043d\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435.";
+            return false;
+        }
+        if (!FreeChoice() && st.type != TASK_NONE && st.type != type)
+        {
+            err = "\u0421\u0435\u0433\u043e\u0434\u043d\u044f \u0442\u044b \u0443\u0436\u0435 \u0432\u044b\u0431\u0440\u0430\u043b \u0434\u0440\u0443\u0433\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435.";
+            return false;
+        }
+        if (st.type == type && st.acceptedAt && !st.completed)
+        {
+            err = "\u042d\u0442\u043e \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0443\u0436\u0435 \u0430\u043a\u0442\u0438\u0432\u043d\u043e.";
+            return false;
+        }
+
+        uint32 param = 0;
+        if (type == TASK_CONTINENT)
+        {
+            uint32 const mapId = player->GetMapId();
+            if (mapId != 0 && mapId != 1)
+            {
+                err = "\u042d\u0442\u043e \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u043c\u043e\u0436\u043d\u043e \u0432\u0437\u044f\u0442\u044c \u0442\u043e\u043b\u044c\u043a\u043e \u0432 \u0412\u043e\u0441\u0442\u043e\u0447\u043d\u044b\u0445 \u043a\u043e\u0440\u043e\u043b\u0435\u0432\u0441\u0442\u0432\u0430\u0445 \u0438\u043b\u0438 \u041a\u0430\u043b\u0438\u043c\u0434\u043e\u0440\u0435.";
+                return false;
+            }
+            param = mapId == 0 ? 1 : 0;
+        }
+        else if (type == TASK_SPEED)
+        {
+            // Owner 2026-06-11: speed hunts a NORMAL-rank nemesis on the
+            // CURRENT continent.
+            Map* pmap = player->GetMap();
+            if (!pmap || pmap->Instanceable())
+            {
+                err = "\u042d\u0442\u043e \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u043c\u043e\u0436\u043d\u043e \u0432\u0437\u044f\u0442\u044c \u0442\u043e\u043b\u044c\u043a\u043e \u043f\u043e\u0434 \u043e\u0442\u043a\u0440\u044b\u0442\u044b\u043c \u043d\u0435\u0431\u043e\u043c.";
+                return false;
+            }
+            param = pmap->GetId();
+        }
+
+        st.type = type;
+        st.acceptedAt = uint32(GameTime::GetGameTime().count());
+        st.param = param;
+        st.completed = false;
+
+        // The task NAMES a concrete target: a nemesis for speed/continent
+        // (existing preferred, silent breeding otherwise; completion stays
+        // generous) or a specific dungeon MAP for the clearing task.
+        st.targetSpawn = (type == TASK_DUNGEON)
+            ? PickTargetDungeonMap(player)
+            : PickWorldTarget(player, type, param);
+
+        // Push the named target straight to the accepter's addon - the
+        // zone push at breeding only reaches players near the target.
+        if (st.targetSpawn && type != TASK_DUNGEON)
+        {
+            NemesisState tstate;
+            if (TryGetNemesisState(ObjectGuid::LowType(st.targetSpawn), tstate))
+                SendValidatedNemesisUpsert(player, ObjectGuid::LowType(st.targetSpawn), tstate);
+        }
+
+        // ONLY the named target completes a world hunt - a target MUST exist.
+        if ((type == TASK_SPEED || type == TASK_CONTINENT) && !st.targetSpawn)
+        {
+            st.acceptedAt = 0;
+            Persist(player, st);
+            err = "\u0414\u043e\u0431\u044b\u0447\u0430 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u0430 - \u043f\u043e\u043f\u0440\u043e\u0431\u0443\u0439 \u0447\u0443\u0442\u044c \u043f\u043e\u0437\u0436\u0435.";
+            return false;
+        }
+        Persist(player, st);
+
+        // Accept confirmation, contract-style. The addon parses the
+        // anchor to show the active task.
+        std::string condition;
+        std::string title;
+        std::string zone;
+        bool const haveTarget = GetTargetDisplay(st.targetSpawn, title, zone);
+        switch (type)
+        {
+            case TASK_SPEED:
+                condition = haveTarget
+                    ? Acore::StringFormat("\u0422\u0432\u043e\u044f \u0446\u0435\u043b\u044c - {} ({}). \u0423\u043f\u0440\u0430\u0432\u044c\u0441\u044f \u0437\u0430 {}.", title, zone, FormatDuration(GetSpeedLimitSeconds()))
+                    : Acore::StringFormat("\u041d\u0430\u0441\u0442\u0438\u0433\u043d\u0438 \u0434\u043e\u0431\u044b\u0447\u0443 \u043d\u0430 \u044d\u0442\u043e\u043c \u043a\u043e\u043d\u0442\u0438\u043d\u0435\u043d\u0442\u0435 \u0437\u0430 {}.", FormatDuration(GetSpeedLimitSeconds()));
+                break;
+            case TASK_CONTINENT:
+                condition = haveTarget
+                    ? Acore::StringFormat("\u0421\u0440\u0430\u0437\u0438 \u0433\u0440\u043e\u0437\u043d\u043e\u0433\u043e \u0432\u0440\u0430\u0433\u0430: {} ({}).", title, zone)
+                    : Acore::StringFormat("\u0421\u0440\u0430\u0437\u0438 \u0433\u0440\u043e\u0437\u043d\u043e\u0433\u043e \u0432\u0440\u0430\u0433\u0430 {}.", ContinentName(param));
+                break;
+            case TASK_DUNGEON:
+                condition = st.targetSpawn
+                    ? Acore::StringFormat("\u0417\u0430\u0447\u0438\u0441\u0442\u0438 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435 \u00ab{}\u00bb: \u0443\u0431\u0435\u0439 \u043d\u0435 \u043c\u0435\u043d\u0435\u0435 {} \u0441\u0438\u043b\u044c\u043d\u044b\u0445 \u0447\u0443\u0434\u043e\u0432\u0438\u0449.", DungeonName(st.targetSpawn), GetDungeonMinKills(player))
+                    : TaskOfferText(TASK_DUNGEON);
+                break;
+            default:
+                break;
+        }
+        ChatHandler(player->GetSession()).PSendSysMessage(
+            "\u041f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u043f\u0440\u0438\u043d\u044f\u0442\u043e: {}. {}",
+            TaskName(type), condition);
+        return true;
+    }
+
+    void Abandon(Player* player)
+    {
+        TaskState& st = Load(player);
+        if (st.type == TASK_NONE || st.completed || !st.acceptedAt)
+            return;
+        st.acceptedAt = 0;  // day stays locked to this type
+        Persist(player, st);
+
+        // Addon clears the active-task display on this anchor.
+        ChatHandler(player->GetSession()).PSendSysMessage(
+            "\u041f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u043e\u0442\u043c\u0435\u043d\u0435\u043d\u043e.");
+    }
+
+    // Reward is ALWAYS mailed (owner request 2026-06-07) with varied RP
+    // flavor from the innkeeper (creature 190002 — the bounty mail sender).
+    void SendTaskRewardMail(Player* player, uint8 type, uint32 itemId, uint32 count)
+    {
+        static char const* const subjects[] = {
+            "\u041d\u0430\u0433\u0440\u0430\u0434\u0430 \u0437\u0430 \u043e\u0441\u043e\u0431\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435",
+            "\u041c\u043e\u043d\u0435\u0442\u0430 \u0430\u0432\u0430\u043d\u0442\u044e\u0440\u0438\u0441\u0442\u0430",
+            "\u0417\u0430 \u0432\u0435\u0440\u043d\u0443\u044e \u0441\u043b\u0443\u0436\u0431\u0443",
+            "\u041f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d\u043e",
+        };
+
+        static char const* const speedBodies[] = {
+            "\u0411\u044b\u0441\u0442\u0440\u043e \u0441\u0440\u0430\u0431\u043e\u0442\u0430\u043d\u043e! \u041c\u043e\u043b\u0432\u0430 \u043e \u0442\u0430\u043a\u043e\u0439 \u043f\u0440\u044b\u0442\u0438 \u0440\u0430\u0437\u043b\u0435\u0442\u0438\u0442\u0441\u044f \u043f\u043e \u0442\u0430\u0432\u0435\u0440\u043d\u0430\u043c.\n\n\u0414\u0435\u0440\u0436\u0438 \u0441\u0432\u043e\u044e \u043c\u043e\u043d\u0435\u0442\u0443.",
+            "\u041d\u0435 \u0443\u0441\u043f\u0435\u043b \u044f \u0434\u043e\u043f\u0438\u0442\u044c \u043a\u0440\u0443\u0436\u043a\u0443, \u0430 \u0434\u0435\u043b\u043e \u0443\u0436\u0435 \u0441\u0434\u0435\u043b\u0430\u043d\u043e.\n\n\u0417\u0430\u0441\u043b\u0443\u0436\u0435\u043d\u043d\u0430\u044f \u043d\u0430\u0433\u0440\u0430\u0434\u0430.",
+            "\u0421\u043a\u043e\u0440\u043e\u0441\u0442\u044c - \u0442\u0432\u043e\u0451 \u0432\u0442\u043e\u0440\u043e\u0435 \u0438\u043c\u044f.\n\n\u041c\u043e\u043d\u0435\u0442\u0430 \u0442\u0432\u043e\u044f \u043f\u043e \u043f\u0440\u0430\u0432\u0443.",
+        };
+        static char const* const continentBodies[] = {
+            "\u0414\u0430\u043b\u044c\u043d\u044f\u044f \u0434\u043e\u0440\u043e\u0433\u0430, \u0447\u0443\u0436\u0438\u0435 \u0437\u0435\u043c\u043b\u0438 - \u0430 \u0442\u044b \u0441\u043f\u0440\u0430\u0432\u0438\u043b\u0441\u044f.\n\n\u041c\u043e\u043d\u0435\u0442\u0430 \u0442\u0432\u043e\u044f.",
+            "\u0413\u043e\u0432\u043e\u0440\u044f\u0442, \u0442\u0435\u0431\u044f \u0432\u0438\u0434\u0435\u043b\u0438 \u0437\u0430 \u043c\u043e\u0440\u0435\u043c. \u0421\u043b\u0443\u0445\u0438 \u043d\u0435 \u0432\u0440\u0443\u0442.\n\n\u0412\u043e\u0442 \u0442\u0432\u043e\u044f \u043d\u0430\u0433\u0440\u0430\u0434\u0430.",
+            "\u0427\u0435\u0440\u0435\u0437 \u043e\u043a\u0435\u0430\u043d \u0437\u0430 \u0433\u043e\u043b\u043e\u0432\u043e\u0439 \u0447\u0443\u0434\u043e\u0432\u0438\u0449\u0430 - \u0442\u0430\u043a\u043e\u0435 \u0437\u0430\u043f\u043e\u043c\u043d\u044f\u0442.\n\n\u0414\u0435\u0440\u0436\u0438 \u043c\u043e\u043d\u0435\u0442\u0443.",
+        };
+        static char const* const dungeonBodies[] = {
+            "\u0414\u0430\u0436\u0435 \u0432 \u0442\u0451\u043c\u043d\u044b\u0445 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u044f\u0445 \u0447\u0443\u0434\u043e\u0432\u0438\u0449\u0430\u043c \u043d\u0435 \u0441\u043a\u0440\u044b\u0442\u044c\u0441\u044f \u043e\u0442 \u0442\u0435\u0431\u044f.\n\n\u041d\u0430\u0433\u0440\u0430\u0434\u0430 \u0432\u043d\u0443\u0442\u0440\u0438.",
+            "\u0418\u0437 \u0442\u0430\u043a\u0438\u0445 \u0433\u043b\u0443\u0431\u0438\u043d \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442\u0441\u044f \u043d\u0435 \u043a\u0430\u0436\u0434\u044b\u0439.\n\n\u041c\u043e\u043d\u0435\u0442\u0430 - \u0442\u0432\u043e\u044f.",
+            "\u041f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u044f \u0448\u0435\u043f\u0447\u0443\u0442 \u043e \u0442\u0432\u043e\u0435\u0439 \u043e\u0445\u043e\u0442\u0435.\n\n\u0417\u0430\u0441\u043b\u0443\u0436\u0435\u043d\u043e.",
+        };
+
+        char const* const* bodies = speedBodies;
+        switch (type)
+        {
+            case TASK_CONTINENT: bodies = continentBodies; break;
+            case TASK_DUNGEON:   bodies = dungeonBodies;   break;
+            default: break;
+        }
+
+        std::string const subject = subjects[urand(0, 3)];
+        std::string const body = bodies[urand(0, 2)];
+
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+        MailDraft draft(subject, body);
+        if (Item* item = Item::CreateItem(itemId, count, player))
+        {
+            item->SaveToDB(trans);
+            draft.AddItem(item);
+        }
+        draft.SendMailTo(trans,
+            MailReceiver(player, player->GetGUID().GetCounter()),
+            MailSender(MAIL_CREATURE, 190002),  // virtual "Innkeeper" mail sender
+            MAIL_CHECK_MASK_NONE, 0);
+        CharacterDatabase.CommitTransaction(trans);
+    }
+
+    // Called per reward recipient when a nemesis (persistent or temporary)
+    // dies. Group members each check their own task.
+    void OnNemesisKilled(Player* player, Creature* killed)
+    {
+        if (!IsEnabled() || !player || !killed)
+            return;
+
+        TaskState& st = Load(player);
+        if (st.type == TASK_NONE || st.completed || !st.acceptedAt)
+            return;
+
+        uint32 const now = uint32(GameTime::GetGameTime().count());
+        bool ok = false;
+        switch (st.type)
+        {
+            case TASK_SPEED:
+                if (now - st.acceptedAt > GetSpeedLimitSeconds())
+                {
+                    // Timer ran out - drop to abandoned so the player can
+                    // re-accept the same task for a fresh timer.
+                    st.acceptedAt = 0;
+                    Persist(player, st);
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "\u0412\u0440\u0435\u043c\u044f \u0432\u044b\u0448\u043b\u043e. \u0412\u043e\u0437\u044c\u043c\u0438 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0443 \u0442\u0440\u0430\u043a\u0442\u0438\u0440\u0449\u0438\u043a\u0430 \u0437\u0430\u043d\u043e\u0432\u043e.");
+                    break;
+                }
+                // NORMAL-rank on the continent recorded at accept, within
+                // +-TargetLevelBand of the player. Misses are SILENT - the
+                // task just stays active until done (owner 2026-06-12).
+                // ONLY the named target completes the hunt (owner 2026-06-12).
+                ok = st.targetSpawn && uint32(killed->GetSpawnId()) == st.targetSpawn;
+                break;
+            case TASK_CONTINENT:
+            {
+                // Opposite classic continent + ELITE, within +-TargetLevelBand
+                // of the player. Misses are SILENT (owner 2026-06-12).
+                // ONLY the named target completes the hunt (owner 2026-06-12).
+                ok = st.targetSpawn && uint32(killed->GetSpawnId()) == st.targetSpawn;
+                break;
+            }
+            case TASK_DUNGEON:
+            {
+                // Clearing run: at least DungeonMinKills dungeon-nemesis
+                // kills AND none left alive in THIS instance. The kill floor
+                // closes the "one nemesis at the entrance = instant clear"
+                // hole; cross-instance counting keeps the task finishable
+                // when a stray death steals the last tag.
+                Map* map = killed->GetMap();
+                if (!map || !map->IsDungeon())
+                    break;
+                if (map->IsRaid() && !sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.IncludeRaids", false))
+                    break;
+
+                // The clearing is bound to the dungeon named at accept;
+                // kills elsewhere are silently ignored (owner 2026-06-12).
+                if (st.targetSpawn && map->GetId() != st.targetSpawn)
+                    break;
+
+                ++st.param;  // kill counter (param is continent-only otherwise)
+
+                // Owner 2026-06-11: plain kill quota, rank-scaled; the old
+                // none-left-alive condition was confusing and is gone.
+                if (st.param >= GetDungeonMinKills(player))
+                {
+                    ok = true;
+                    break;
+                }
+
+                Persist(player, st);
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "\u041e\u0445\u043e\u0442\u0430 \u0432\u043e \u0442\u044c\u043c\u0435: \u043f\u043e\u0432\u0435\u0440\u0436\u0435\u043d\u043e {} \u0438\u0437 {}.", uint32(st.param), GetDungeonMinKills(player));
+                break;
+            }
+            default:
+                break;
+        }
+
+        if (!ok)
+            return;
+
+        st.completed = true;
+        Persist(player, st);
+
+        uint32 const rewardItem = sConfigMgr->GetOption<uint32>("NemesisSpecialTask.RewardItem", 110150);
+        uint32 const rewardCount = GetRewardCount(st.type);
+        SendTaskRewardMail(player, st.type, rewardItem, rewardCount);
+
+        // Hunter's Covenant bonus for the daily task (owner 2026-06-12):
+        // base + 1 x hunter rank (101-105 on the lean PTR economy).
+        {
+            uint32 const repBase = sConfigMgr->GetOption<uint32>("NemesisRep.SpecialTaskBonus", 100);
+            uint32 const repPerRank = sConfigMgr->GetOption<uint32>("NemesisRep.SpecialTaskPerRank", 1);
+            if (uint32 const repBonus = repBase + repPerRank * NemesisReputation::GetRank(player))
+                NemesisReputation::AddPoints(player, repBonus);
+        }
+
+        ChatHandler(player->GetSession()).PSendSysMessage(
+            // "Особое поручение выполнено! Награда отправлена почтой."
+            "\u041e\u0441\u043e\u0431\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d\u043e! \u041d\u0430\u0433\u0440\u0430\u0434\u0430 \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0430 \u043f\u043e\u0447\u0442\u043e\u0439.");
+    }
+}
+
 class NemesisSystemPlayerScript : public PlayerScript
 {
 public:
@@ -2064,11 +3415,31 @@ public:
     void OnPlayerLogin(Player* player) override
     {
         NemesisReputation::OnLogin(player);
+
+        // Strip orphan familiar auras left over from a previous session.
+        //
+        // Why this is needed: familiar owner-auras are permanent + flagged
+        // NO_AURA_CANCEL, so they survive player save. On logout the pet
+        // despawns and `OnCreatureRemoveWorld` removes the aura in-memory,
+        // but `Player::SaveToDB()` runs earlier in the logout sequence and
+        // persists the still-active aura into `character_aura`. On next
+        // login `Player::LoadFromDB()` re-applies it — but companions do
+        // NOT auto-summon on login, so the aura ends up active with no
+        // pet to back it.
+        //
+        // Stripping all familiar auras on login is safe: if the player
+        // re-summons their pet, `OnCreatureAddWorld` re-applies both buff
+        // and debuff via the standard path.
+        for (uint32 spellId = 103000; spellId <= 103099; ++spellId)
+            player->RemoveAurasDueToSpell(spellId);
+        for (uint32 spellId = 104000; spellId <= 104099; ++spellId)
+            player->RemoveAurasDueToSpell(spellId);
     }
 
     void OnPlayerLogout(Player* player) override
     {
         NemesisReputation::OnLogout(player);
+        NemesisSpecialTask::OnLogout(player);
         // Drop cached bounty pools for this player — they're cheap to
         // regenerate on next login and otherwise grow unboundedly across
         // logins over long server uptime.
@@ -2106,8 +3477,8 @@ public:
                 <= Acore::XP::GetGrayLevel(recipients.highestLevel);
             if (!isGray)
             {
-                uint32 const base = sConfigMgr->GetOption<uint32>("NemesisRep.BasePerKill", 50);
-                uint32 const perRank = sConfigMgr->GetOption<uint32>("NemesisRep.PerRankBonus", 10);
+                uint32 const base = sConfigMgr->GetOption<uint32>("NemesisRep.BasePerKill", 0);
+                uint32 const perRank = sConfigMgr->GetOption<uint32>("NemesisRep.PerRankBonus", 1);
                 uint32 const award = base + perRank * uint32(state.rank);
                 for (Player* recipient : recipients.players)
                     NemesisReputation::AddPoints(recipient, award);
@@ -2123,7 +3494,6 @@ public:
             if (NemesisBountyBoard::CheckCompletion(recipient, killed, bountyTitle, bountyRank))
             {
                 ChatHandler(recipient->GetSession()).PSendSysMessage(
-                    "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
                     "\xD0\x9A\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xB2\xD1\x8B\xD0\xBF\xD0\xBE\xD0\xBB\xD0\xBD\xD0\xB5\xD0\xBD: {}",  // "Контракт выполнен: {}"
                     bountyTitle);
 
@@ -2131,22 +3501,31 @@ public:
                 // Ungated: the board only offers level-appropriate targets,
                 // so there's no exploit window for farming gray contracts.
                 uint32 const bonusFlat = sConfigMgr->GetOption<uint32>(
-                    "NemesisRep.BountyCompletionBonus", 200);
+                    "NemesisRep.BountyCompletionBonus", 10);
                 uint32 const bonusPerRank = sConfigMgr->GetOption<uint32>(
-                    "NemesisRep.BountyCompletionPerRank", 50);
+                    "NemesisRep.BountyCompletionPerRank", 5);
                 NemesisReputation::AddPoints(recipient,
                     bonusFlat + bonusPerRank * uint32(bountyRank));
             }
         }
 
+        // Special daily task — each recipient checks their own active task
+        // (covers group credit: "в группе или без").
+        for (Player* recipient : recipients.players)
+            NemesisSpecialTask::OnNemesisKilled(recipient, killed);
+
         if (ShouldAnnounceKill() && state.rank >= GetAnnounceMinRank())
         {
-            // [Немезида]: Honktu отомстил(а) Поганоглаз Ненасытный (ранг 1)!
-            // [Немезида]: Fehkadrit устранил(а) Бесошлён Прожорливый (ранг 1)!
+            // Honktu отомстил(а) Поганоглаз Ненасытный (ранг 1)!
+            // Fehkadrit устранил(а) Бесошлён Прожорливый (ранг 1)!
             std::string message = revenge
-                ? Acore::StringFormat("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} \xD0\xBE\xD1\x82\xD0\xBC\xD1\x81\xD1\x82\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank)
-                : Acore::StringFormat("[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} \xD1\x83\xD1\x81\xD1\x82\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank);
-            BroadcastNemesisMessage(killed, message);
+                ? Acore::StringFormat("{} \xD0\xBE\xD1\x82\xD0\xBC\xD1\x81\xD1\x82\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank)
+                : Acore::StringFormat("{} \xD1\x83\xD1\x81\xD1\x82\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xBB(\xD0\xB0) {} (\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB3 {})!", killer->GetName(), killed->GetName(), state.rank);
+
+            // Dungeon nemesis kills are SILENT (owner 2026-06-07) — no global
+            // and no map feed; the titled corpse is announcement enough.
+            if (!(killed->GetMap() && killed->GetMap()->IsDungeon()))
+                BroadcastNemesisMessage(killed, message);
         }
     }
 
@@ -2156,6 +3535,61 @@ public:
     }
 };
 
+// Familiar entry → owner-aura spell mapping.
+// Gacha pool (10 families × 10 pets = 100 entries) lives at 191000-191099.
+// Linear formula resolves each pet to:
+//   buff aura   = 103000 + (entry - 191000)   (positive-only effects)
+//   debuff aura = 104000 + (entry - 191000)   (negative-only effects)
+// Both auras are applied on summon, removed on dismiss. The split keeps the
+// buff on the buff bar and the debuff on the debuff bar — a mixed row would
+// render as a single buff-bar icon with both lines in the tooltip, because
+// client 3.3.5a classifies the spell as positive/negative as a whole.
+// Auras are kept out of the summon spell itself because Effect_2 APPLY_AURA
+// breaks companion-menu classification (implementation log bug #8).
+// Cast site guards 104xxx with sSpellMgr lookup so pets without a debuff
+// row (clean Commons, Rares) generate no log spam.
+// T1 pets (190010-012) retired 2026-07-02: character_spell remapped to gacha
+// successors, old rows dropped. Entries 190010/190011 now belong to
+// mod-transmog (Warpweaver / Ethereal Warpweaver — a player-owned TempSummon),
+// so no fallback mapping may exist here or the transmog pet would get
+// familiar owner-auras applied.
+struct FamiliarAuras
+{
+    uint32 buff = 0;
+    uint32 debuff = 0;
+};
+
+static FamiliarAuras GetFamiliarOwnerAuraSpells(uint32 entry)
+{
+    if (entry >= 191000 && entry <= 191099)
+    {
+        uint32 const offset = entry - 191000;
+        FamiliarAuras out;
+        out.buff   = 103000 + offset;
+        out.debuff = 104000 + offset; // optional; cast site checks sSpellMgr
+        return out;
+    }
+
+    return {};
+}
+
+// Resolves the player to apply/remove aura on. Minipets use TempSummon +
+// summoner GUID; GetOwner() is usually null for SPELL_EFFECT_SUMMON with
+// MINIPET properties. Resolve via the summoner guid and fall back to
+// GetOwner for safety.
+static Player* GetFamiliarOwnerPlayer(Creature* creature)
+{
+    if (!creature)
+        return nullptr;
+    if (TempSummon* temp = creature->ToTempSummon())
+        if (Unit* s = temp->GetSummonerUnit())
+            if (Player* player = s->ToPlayer())
+                return player;
+    if (Unit* owner = creature->GetOwner())
+        return owner->ToPlayer();
+    return nullptr;
+}
+
 class NemesisSystemAllCreatureScript : public AllCreatureScript
 {
 public:
@@ -2163,6 +3597,18 @@ public:
 
     void OnCreatureAddWorld(Creature* creature) override
     {
+        FamiliarAuras const auras = GetFamiliarOwnerAuraSpells(creature->GetEntry());
+        if (auras.buff)
+        {
+            if (Player* player = GetFamiliarOwnerPlayer(creature))
+            {
+                player->CastSpell(player, auras.buff, true);
+                if (auras.debuff && sSpellMgr->GetSpellInfo(auras.debuff))
+                    player->CastSpell(player, auras.debuff, true);
+            }
+            return;
+        }
+
         NemesisState state;
         bool found = TryGetNemesisState(creature, state);
 
@@ -2184,7 +3630,12 @@ public:
         }
 
         if (!found)
+        {
+            // Fresh spawn with no state — in dungeon maps this is where a
+            // creature may roll into a temporary dungeon nemesis.
+            TryRollDungeonNemesis(creature);
             return;
+        }
 
         ApplyNemesisState(creature, state);
 
@@ -2216,6 +3667,8 @@ public:
                 }
             }
         }
+        else if (ActiveTemporaryNemeses.count(creature->GetGUID()))
+            ActiveTemporaryNemeses[creature->GetGUID()] = state;  // temp-resident (dungeon) — never to the persistent store
         else if (ObjectGuid::LowType const spawnId = creature->GetSpawnId())
             ActiveNemeses[spawnId] = state;
         else if (IsTemporaryNemesisCandidate(creature))
@@ -2224,9 +3677,23 @@ public:
 
     void OnCreatureRemoveWorld(Creature* creature) override
     {
-        if (!creature || creature->GetSpawnId())
+        if (!creature)
             return;
 
+        FamiliarAuras const auras = GetFamiliarOwnerAuraSpells(creature->GetEntry());
+        if (auras.buff)
+        {
+            if (Player* player = GetFamiliarOwnerPlayer(creature))
+            {
+                player->RemoveAurasDueToSpell(auras.buff);
+                if (auras.debuff)
+                    player->RemoveAurasDueToSpell(auras.debuff);
+            }
+            return;
+        }
+
+        // Always erase guid-keyed temp entries — dungeon nemeses carry
+        // spawnIds but live in the temporary store only.
         ActiveTemporaryNemeses.erase(creature->GetGUID());
         TemporaryRegenTickAccumulators.erase(creature->GetGUID());
     }
@@ -2240,11 +3707,28 @@ public:
         if (!TryGetNemesisState(creature, state))
             return;
 
-        if (creature->IsAlive())
+        if (!creature->IsAlive())
+        {
+            EraseRegenAccumulator(creature);
+            DeleteNemesisState(creature, "dead");
             return;
+        }
 
-        EraseRegenAccumulator(creature);
-        DeleteNemesisState(creature, "dead");
+        // Self-heal scaled max health. A creature re-init (JUST_RESPAWNED ->
+        // SelectLevel -> InitStatsForLevel, which a freshly entered dungeon's
+        // creatures hit on their first Update) resets UNIT_MOD_HEALTH
+        // BASE_VALUE to the template base, wiping our scaled max health while
+        // leaving scale intact (model big, HP normal). Re-assert when the
+        // live max has drifted BELOW target; preserve the current health %
+        // so this never becomes a heal loop in combat. Fires once per drift
+        // (ApplyNemesisState restores the BASE_VALUE mod).
+        uint32 const expectedMax = std::max<uint32>(1, uint32(float(state.baseHealth) * GetHealthMultiplier(state.rank)));
+        if (creature->GetMaxHealth() < expectedMax)
+        {
+            float const pct = creature->GetHealthPct();
+            ApplyNemesisState(creature, state);
+            creature->SetHealth(std::max<uint32>(1, uint32(float(expectedMax) * pct / 100.0f)));
+        }
     }
 };
 
@@ -2352,7 +3836,8 @@ public:
             { "mapclear", HandleMapClear, SEC_GAMEMASTER, Console::No },
             { "clearall", HandleClearAll, SEC_ADMINISTRATOR, Console::Yes },
             { "reload", HandleReload, SEC_ADMINISTRATOR, Console::Yes },
-            { "merge-rares", HandleMergeRares, SEC_ADMINISTRATOR, Console::Yes }
+            { "merge-rares", HandleMergeRares, SEC_ADMINISTRATOR, Console::Yes },
+            { "ambient", HandleAmbient, SEC_GAMEMASTER, Console::Yes }
         };
 
         static ChatCommandTable commandTable =
@@ -2361,6 +3846,16 @@ public:
         };
 
         return commandTable;
+    }
+
+    // Force one ambient-generation pass (same code the periodic tick runs).
+    static bool HandleAmbient(ChatHandler* handler)
+    {
+        uint32 births = 0;
+        uint32 rankUps = 0;
+        RunAmbientGenerationTick(births, rankUps);
+        handler->PSendSysMessage("Nemesis ambient tick: {} births, {} rank-ups.", births, rankUps);
+        return true;
     }
 
     static bool HandleAddonBootstrap(ChatHandler* handler)
@@ -2376,7 +3871,7 @@ public:
         return true;
     }
 
-    static bool HandleAddonReport(ChatHandler* handler, uint64 rawSpawnId)
+    static bool HandleAddonReport(ChatHandler* handler, uint64 rawSpawnId, Optional<uint32> entryArg)
     {
         Player* player = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
         if (!player)
@@ -2390,15 +3885,28 @@ public:
         if (!TryGetNemesisState(spawnId, state))
             return true;
 
+        // Verify the player's selected target actually IS the nemesis being
+        // reported. Without this check, a buggy or malicious client could
+        // overwrite the row with the player's location for any spawn_id
+        // (the original cause of corrupted Thunder Bluff coordinates on
+        // Stranglethorn-resident nemeses — see addon parseCreatureGuid).
+        Unit* targetUnit = ObjectAccessor::GetUnit(*player, player->GetTarget());
+        Creature* creature = targetUnit ? targetUnit->ToCreature() : nullptr;
+        if (!creature || creature->GetSpawnId() != spawnId)
+            return true;
+
+        if (entryArg && *entryArg != 0 && creature->GetEntry() != *entryArg)
+            return true;
+
         uint32 const now = uint32(GameTime::GetGameTime().count());
         if (state.lastSeenAt && state.lastSeenAt + GetAddonReportCooldownSeconds() > now)
             return true;
 
-        state.mapId = player->GetMapId();
-        state.zoneId = player->GetZoneId();
-        state.homeX = player->GetPositionX();
-        state.homeY = player->GetPositionY();
-        state.homeZ = player->GetPositionZ();
+        state.mapId = creature->GetMapId();
+        state.zoneId = creature->GetZoneId();
+        state.homeX = creature->GetPositionX();
+        state.homeY = creature->GetPositionY();
+        state.homeZ = creature->GetPositionZ();
         state.lastSeenAt = now;
 
         ActiveNemeses[spawnId] = state;
@@ -3077,8 +4585,7 @@ namespace NemesisBountyBoard
             // Notify once; subsequent calls find no row and return early.
             // Client addon parses this to clear its bounty highlight.
             ChatHandler(player->GetSession()).PSendSysMessage(
-                // "[Немезида]: Контракт на {} истёк."
-                "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
+                // "Контракт на {} истёк."
                 "\xD0\x9A\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 "
                 "\xD0\xBD\xD0\xB0 {} "
                 "\xD0\xB8\xD1\x81\xD1\x82\xD1\x91\xD0\xBA.",
@@ -3098,9 +4605,9 @@ namespace NemesisBountyBoard
         if (!player) return;
         if (!sConfigMgr->GetOption<bool>("NemesisSystem.BountyBoard.AnnounceAccept", true))
             return;
-        // "|cffff0000[Немезида]: {} принял(а) контракт на {}!|r"
+        // "|cffff0000{} принял(а) контракт на {}!|r"
         std::string msg = Acore::StringFormat(
-            "|cffff0000[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} "
+            "|cffff0000{} "
             "\xD0\xBF\xD1\x80\xD0\xB8\xD0\xBD\xD1\x8F\xD0\xBB(\xD0\xB0) "
             "\xD0\xBA\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xBD\xD0\xB0 {}!|r",
             player->GetName(), title);
@@ -3112,9 +4619,9 @@ namespace NemesisBountyBoard
         if (!player) return;
         if (!sConfigMgr->GetOption<bool>("NemesisSystem.BountyBoard.AnnounceCompletion", true))
             return;
-        // "|cffff0000[Немезида]: {} выполнил(а) контракт на {}!|r"
+        // "|cffff0000{} выполнил(а) контракт на {}!|r"
         std::string msg = Acore::StringFormat(
-            "|cffff0000[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: {} "
+            "|cffff0000{} "
             "\xD0\xB2\xD1\x8B\xD0\xBF\xD0\xBE\xD0\xBB\xD0\xBD\xD0\xB8\xD0\xBB(\xD0\xB0) "
             "\xD0\xBA\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xBD\xD0\xB0 {}!|r",
             player->GetName(), title);
@@ -3252,8 +4759,7 @@ namespace NemesisBountyBoard
             if (Player* online = ObjectAccessor::FindConnectedPlayer(recvGuid))
             {
                 ChatHandler(online->GetSession()).PSendSysMessage(
-                    // "[Немезида]: Контракт на {} отменён (цель устранена)."
-                    "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
+                    // "Контракт на {} отменён (цель устранена)."
                     "\xD0\x9A\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xBD\xD0\xB0 {} \xD0\xBE\xD1\x82\xD0\xBC\xD0\xB5\xD0\xBD\xD1\x91\xD0\xBD "
                     "(\xD1\x86\xD0\xB5\xD0\xBB\xD1\x8C \xD1\x83\xD1\x81\xD1\x82\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xB0).",
                     a.title);
@@ -3562,8 +5068,7 @@ namespace NemesisReputation
             rankedUp = true;
 
             ChatHandler(player->GetSession()).PSendSysMessage(
-                // "[Немезида]: Новый ранг — {}."
-                "[\u041d\u0435\u043c\u0435\u0437\u0438\u0434\u0430]: "
+                // "Новый ранг — {}."
                 "\u041d\u043e\u0432\u044b\u0439 \u0440\u0430\u043d\u0433 \u2014 {}.",
                 GetRankName(newRank));
         }
@@ -3650,6 +5155,21 @@ class NemesisBountyVendorScript : public AllCreatureScript
     static constexpr uint32 BOARD_BACK_ACTION          = GOSSIP_ACTION_INFO_DEF + 9002;
     static constexpr uint32 BOARD_ACTIVE_VIEW_ACTION   = GOSSIP_ACTION_INFO_DEF + 9003;
     static constexpr uint32 BOARD_ABANDON_ACTION       = GOSSIP_ACTION_INFO_DEF + 9004;
+    // Rank-gated shop submenus (2026-06-07): rank 1 general goods, rank 2
+    // StatBooster consumables, rank 3 familiar gacha bags.
+    static constexpr uint32 SHOP_GENERAL_ACTION        = GOSSIP_ACTION_INFO_DEF + 9005;
+    static constexpr uint32 SHOP_STATBOOST_ACTION      = GOSSIP_ACTION_INFO_DEF + 9006;
+    static constexpr uint32 SHOP_FAMILIAR_ACTION       = GOSSIP_ACTION_INFO_DEF + 9007;
+    static constexpr uint32 SHOP_BACK_ACTION           = GOSSIP_ACTION_INFO_DEF + 9008;
+    static constexpr uint32 SHOP_VETERAN_ACTION        = GOSSIP_ACTION_INFO_DEF + 9009;
+    // Special daily task (особое поручение). Accept actions are
+    // TASK_MENU_ACTION + TaskType (1=speed, 2=continent, 3=dungeon).
+    static constexpr uint32 RANK_INFO_ACTION           = GOSSIP_ACTION_INFO_DEF + 9015;
+
+    static constexpr uint32 TASK_MENU_ACTION           = GOSSIP_ACTION_INFO_DEF + 9010;
+    static constexpr uint32 TASK_ACCEPT_FIRST          = GOSSIP_ACTION_INFO_DEF + 9011;
+    static constexpr uint32 TASK_ACCEPT_LAST           = GOSSIP_ACTION_INFO_DEF + 9013;
+    static constexpr uint32 TASK_ABANDON_ACTION        = GOSSIP_ACTION_INFO_DEF + 9014;
     // Slot-indexed ranges (room for 100 slots; SlotsPerDay default is 3).
     static constexpr uint32 BOARD_DETAIL_BASE_ACTION   = GOSSIP_ACTION_INFO_DEF + 9100;  // +slot
     static constexpr uint32 BOARD_ACCEPT_BASE_ACTION   = GOSSIP_ACTION_INFO_DEF + 9300;  // +slot
@@ -3690,6 +5210,24 @@ public:
             AddGossipItemFor(player, INNKEEPER_GOSSIP_MENU, 1,
                 GOSSIP_SENDER_MAIN, GOSSIP_ACTION_INN);
 
+        // ── Hunter rank summary (opens a read-only progress screen) ──
+        if (sConfigMgr->GetOption<bool>("NemesisRep.Enable", true))
+        {
+            uint8 const repRank = NemesisReputation::GetRank(player);
+            uint32 const repPoints = NemesisReputation::GetPoints(player);
+            // menu line: "Ранг: «<name>» - <points>/<next>" (or " (макс)")
+            std::string rankLine = repRank >= GetMaxRank()
+                ? Acore::StringFormat(
+                    "Ранг: «{}» - {} (макс)",
+                    NemesisReputation::GetRankName(repRank), repPoints)
+                : Acore::StringFormat(
+                    "Ранг: «{}» - {}/{}",
+                    NemesisReputation::GetRankName(repRank), repPoints,
+                    NemesisReputation::GetThreshold(repRank + 1));
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, rankLine,
+                GOSSIP_SENDER_MAIN, RANK_INFO_ACTION);
+        }
+
         // ── Bounty Hunter Rewards ──
         AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
             "\u041d\u0430\u0433\u0440\u0430\u0434\u044b \u043e\u0445\u043e\u0442\u043d\u0438\u043a\u0430 \u0437\u0430 \u0433\u043e\u043b\u043e\u0432\u0430\u043c\u0438",  // Награды охотника за головами
@@ -3700,6 +5238,12 @@ public:
             AddGossipItemFor(player, GOSSIP_ICON_TAXI,
                 "\u0414\u043e\u0441\u043a\u0430 \u043e\u0431\u044a\u044f\u0432\u043b\u0435\u043d\u0438\u0439 \u043e\u0445\u043e\u0442\u043d\u0438\u043a\u0430 \u0437\u0430 \u0433\u043e\u043b\u043e\u0432\u0430\u043c\u0438",  // Доска объявлений охотника за головами
                 GOSSIP_SENDER_MAIN, BOARD_GOSSIP_ACTION);
+
+        // ── Special daily task ──
+        if (NemesisSpecialTask::IsEnabled())
+            AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1,
+                "\u041e\u0441\u043e\u0431\u043e\u0435 \u043f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435",
+                GOSSIP_SENDER_MAIN, TASK_MENU_ACTION);
 
         player->TalkedToCreature(creature->GetEntry(), creature->GetGUID());
         SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
@@ -3731,22 +5275,97 @@ public:
             return true;
         }
 
-        // ── Bounty vendor ──
+        // ── Bounty vendor: rank-gated shop submenu ──
         if (action == BOUNTY_GOSSIP_ACTION)
         {
-            uint32 vendorEntry = sConfigMgr->GetOption<uint32>(
-                "NemesisSystem.BountyVendor.Entry", 190000);
+            if (sConfigMgr->GetOption<bool>("NemesisSystem.BountyVendor.RankMenus.Enable", true))
+            {
+                ShowShopMenu(player, creature);
+                return true;
+            }
 
-            // Temporarily grant vendor flag so SendListInventory succeeds
-            bool hadVendorFlag = creature->HasNpcFlag(UNIT_NPC_FLAG_VENDOR);
-            if (!hadVendorFlag)
-                creature->SetNpcFlag(UNIT_NPC_FLAG_VENDOR);
+            // Legacy flat vendor (RankMenus disabled)
+            OpenVendor(player, creature, sConfigMgr->GetOption<uint32>(
+                "NemesisSystem.BountyVendor.Entry", 190000));
+            return true;
+        }
 
-            player->GetSession()->SendListInventory(creature->GetGUID(), vendorEntry);
+        // ── Shop submenu: back to the innkeeper root menu ──
+        if (action == SHOP_BACK_ACTION)
+            return CanCreatureGossipHello(player, creature);
 
-            if (!hadVendorFlag)
-                creature->RemoveNpcFlag(UNIT_NPC_FLAG_VENDOR);
+        // ── Hunter rank info screen ──
+        if (action == RANK_INFO_ACTION)
+        {
+            ShowRankInfo(player, creature);
+            return true;
+        }
 
+        // ── Special daily task menu ──
+        if (action == TASK_MENU_ACTION)
+        {
+            ShowSpecialTask(player, creature);
+            return true;
+        }
+
+        if (action >= TASK_ACCEPT_FIRST && action <= TASK_ACCEPT_LAST)
+        {
+            uint8 const type = uint8(action - TASK_MENU_ACTION);  // 1..3 == TaskType
+            std::string err;
+            if (!NemesisSpecialTask::Accept(player, type, err))
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "{}", err);
+            ShowSpecialTask(player, creature);
+            return true;
+        }
+
+        if (action == TASK_ABANDON_ACTION)
+        {
+            NemesisSpecialTask::Abandon(player);
+            ShowSpecialTask(player, creature);
+            return true;
+        }
+
+        // ── Shop submenu: general goods (rank 1, no gate) ──
+        if (action == SHOP_GENERAL_ACTION)
+        {
+            OpenVendor(player, creature, sConfigMgr->GetOption<uint32>(
+                "NemesisSystem.BountyVendor.GeneralEntry", 190100));
+            return true;
+        }
+
+        // ── Shop submenu: StatBooster consumables / familiar bags (gated) ──
+        if (action == SHOP_STATBOOST_ACTION || action == SHOP_FAMILIAR_ACTION || action == SHOP_VETERAN_ACTION)
+        {
+            uint8 need = 0;
+            uint32 vendorEntry = 0;
+            switch (action)
+            {
+                case SHOP_STATBOOST_ACTION:
+                    need = uint8(sConfigMgr->GetOption<uint32>("NemesisSystem.BountyVendor.StatBoosterRank", 2));
+                    vendorEntry = sConfigMgr->GetOption<uint32>("NemesisSystem.BountyVendor.StatBoosterEntry", 190101);
+                    break;
+                case SHOP_FAMILIAR_ACTION:
+                    need = uint8(sConfigMgr->GetOption<uint32>("NemesisSystem.BountyVendor.FamiliarRank", 3));
+                    vendorEntry = sConfigMgr->GetOption<uint32>("NemesisSystem.BountyVendor.FamiliarEntry", 190102);
+                    break;
+                default:
+                    need = uint8(sConfigMgr->GetOption<uint32>("NemesisSystem.BountyVendor.VeteranRank", 4));
+                    vendorEntry = sConfigMgr->GetOption<uint32>("NemesisSystem.BountyVendor.VeteranEntry", 190103);
+                    break;
+            }
+            if (NemesisReputation::GetRank(player) < need)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    // "Эти товары доступны с ранга «{}»."
+                    "\u042d\u0442\u0438 \u0442\u043e\u0432\u0430\u0440\u044b \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b "
+                    "\u0441 \u0440\u0430\u043d\u0433\u0430 \u00ab{}\u00bb.",
+                    NemesisReputation::GetRankName(need));
+                ShowShopMenu(player, creature);
+                return true;
+            }
+
+            OpenVendor(player, creature, vendorEntry);
             return true;
         }
 
@@ -3770,7 +5389,6 @@ public:
             NemesisBountyBoard::AbandonBounty(player);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 // "Контракт отменён."
-                "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
                 "\xD0\x9A\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xBE\xD1\x82\xD0\xBC\xD0\xB5\xD0\xBD\xD1\x91\xD0\xBD.");
             ShowBoard(player, creature);
             return true;
@@ -3795,7 +5413,6 @@ public:
             {
                 ChatHandler(player->GetSession()).PSendSysMessage(
                     // "У вас уже есть активный контракт. Откажитесь сначала."
-                    "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
                     "\xD0\xA3 \xD0\xB2\xD0\xB0\xD1\x81 \xD1\x83\xD0\xB6\xD0\xB5 \xD0\xB5\xD1\x81\xD1\x82\xD1\x8C \xD0\xB0\xD0\xBA\xD1\x82\xD0\xB8\xD0\xB2\xD0\xBD\xD1\x8B\xD0\xB9 \xD0\xBA\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82.");
                 ShowActiveBounty(player, creature);
                 return true;
@@ -3815,8 +5432,7 @@ public:
             if (capCompletions >= NemesisBountyBoard::GetSlotsPerDay())
             {
                 ChatHandler(player->GetSession()).PSendSysMessage(
-                    // "[Немезида]: На сегодня с тебя хватит. Возвращайся позже."
-                    "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
+                    // "На сегодня с тебя хватит. Возвращайся позже."
                     "\xD0\x9D\xD0\xB0 \xD1\x81\xD0\xB5\xD0\xB3\xD0\xBE\xD0\xB4\xD0\xBD\xD1\x8F \xD1\x81 \xD1\x82\xD0\xB5\xD0\xB1\xD1\x8F \xD1\x85\xD0\xB2\xD0\xB0\xD1\x82\xD0\xB8\xD1\x82. "
                     "\xD0\x92\xD0\xBE\xD0\xB7\xD0\xB2\xD1\x80\xD0\xB0\xD1\x89\xD0\xB0\xD0\xB9\xD1\x81\xD1\x8F \xD0\xBF\xD0\xBE\xD0\xB7\xD0\xB6\xD0\xB5.");
                 ShowBoard(player, creature);
@@ -3839,8 +5455,7 @@ public:
             if (bountyIt == ActiveNemeses.end() || bountyIt->second.zoneId != creature->GetZoneId())
             {
                 ChatHandler(player->GetSession()).PSendSysMessage(
-                    // "[Немезида]: Цель ускользнула. Попробуй другой контракт."
-                    "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
+                    // "Цель ускользнула. Попробуй другой контракт."
                     "\xD0\xA6\xD0\xB5\xD0\xBB\xD1\x8C \xD1\x83\xD1\x81\xD0\xBA\xD0\xBE\xD0\xBB\xD1\x8C\xD0\xB7\xD0\xBD\xD1\x83\xD0\xBB\xD0\xB0. \xD0\x9F\xD0\xBE\xD0\xBF\xD1\x80\xD0\xBE\xD0\xB1\xD1\x83\xD0\xB9 \xD0\xB4\xD1\x80\xD1\x83\xD0\xB3\xD0\xBE\xD0\xB9 \xD0\xBA\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82.");
                 ShowBoard(player, creature);
                 return true;
@@ -3851,7 +5466,6 @@ public:
             uint32 const tokens = NemesisBountyBoard::GetRewardTokens(b.rank);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 // "Контракт принят: {} (награда {} жет.)"
-                "[\xD0\x9D\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xB7\xD0\xB8\xD0\xB4\xD0\xB0]: "
                 "\xD0\x9A\xD0\xBE\xD0\xBD\xD1\x82\xD1\x80\xD0\xB0\xD0\xBA\xD1\x82 \xD0\xBF\xD1\x80\xD0\xB8\xD0\xBD\xD1\x8F\xD1\x82: {} (\xD0\xBD\xD0\xB0\xD0\xB3\xD1\x80\xD0\xB0\xD0\xB4\xD0\xB0 {} \xD0\xB6\xD0\xB5\xD1\x82.)",
                 b.title, tokens);
 
@@ -3876,6 +5490,200 @@ public:
     }
 
 private:
+    // Required reputation rank for the gated shop submenus (config-tunable).
+    static uint8 ShopRankRequired(bool familiar)
+    {
+        return uint8(familiar
+            ? sConfigMgr->GetOption<uint32>("NemesisSystem.BountyVendor.FamiliarRank", 3)
+            : sConfigMgr->GetOption<uint32>("NemesisSystem.BountyVendor.StatBoosterRank", 2));
+    }
+
+    // Show a vendor list by virtual npc_vendor entry. Temporarily grants the
+    // vendor flag so SendListInventory succeeds on non-vendor innkeepers.
+    static void OpenVendor(Player* player, Creature* creature, uint32 vendorEntry)
+    {
+        bool const hadVendorFlag = creature->HasNpcFlag(UNIT_NPC_FLAG_VENDOR);
+        if (!hadVendorFlag)
+            creature->SetNpcFlag(UNIT_NPC_FLAG_VENDOR);
+
+        player->GetSession()->SendListInventory(creature->GetGUID(), vendorEntry);
+
+        if (!hadVendorFlag)
+            creature->RemoveNpcFlag(UNIT_NPC_FLAG_VENDOR);
+    }
+
+    // Read-only rank screen: current rank, rep points and progress to the next
+    // rank. Thresholds come from GetThreshold (config), so this never drifts
+    // from the live economy curve.
+    void ShowRankInfo(Player* player, Creature* creature)
+    {
+        ClearGossipMenuFor(player);
+
+        uint8 const rank = NemesisReputation::GetRank(player);
+        uint32 const points = NemesisReputation::GetPoints(player);
+        uint32 const tierFloor = NemesisReputation::GetThreshold(rank);
+
+        std::string header;
+        if (rank >= GetMaxRank())
+            header = Acore::StringFormat(
+                "Ранг {}: «{}».\n\nОчки почёта: {}.\n\nЭто высший ранг охотника. Дальше пути нет.",
+                rank, NemesisReputation::GetRankName(rank), points);
+        else
+        {
+            uint32 const next = NemesisReputation::GetThreshold(rank + 1);
+            uint32 const remaining = next > points ? next - points : 0;
+            header = Acore::StringFormat(
+                "Ранг {}: «{}».\n\nОчки почёта: {}.\n\nДо ранга «{}» осталось {} очк.\nВ текущем ранге: {} / {}.",
+                rank, NemesisReputation::GetRankName(rank), points,
+                NemesisReputation::GetRankName(rank + 1), remaining,
+                points - tierFloor, next - tierFloor);
+        }
+
+        // "Назад"
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Назад",
+            GOSSIP_SENDER_MAIN, SHOP_BACK_ACTION);
+
+        uint32 const customTextId = 0x7D000000u | (player->GetGUID().GetCounter() & 0x00FFFFFFu);
+        SendCustomNpcText(player, header, customTextId);
+        SendGossipMenuFor(player, customTextId, creature->GetGUID());
+    }
+
+    // Rank-gated shop submenu: «Общие товары» (rank 1) / «Печати и нашивки»
+    // (StatBooster, rank 2) / «Сумки с фамильярами» (rank 3). Locked entries
+    // stay visible with a "(требуется ранг: …)" suffix so players see the
+    // progression; clicking one reports the missing rank.
+    void ShowShopMenu(Player* player, Creature* creature)
+    {
+        ClearGossipMenuFor(player);
+
+        uint8 const rank = NemesisReputation::GetRank(player);
+
+        // Rank-named submenus; StatBooster tiers spread T1..T4 over ranks
+        // 1..4 (owner 2026-06-07), rank 5 intentionally idle for now.
+        struct ShopEntry { char const* label; uint32 action; char const* rankKey; uint32 rankDefault; };
+        static ShopEntry const entries[] = {
+            { "\u041d\u0430\u0433\u0440\u0430\u0434\u044b \u043f\u043e\u0441\u043b\u0443\u0448\u043d\u0438\u043a\u0430", SHOP_GENERAL_ACTION,   nullptr, 1 },
+            { "\u041d\u0430\u0433\u0440\u0430\u0434\u044b \u043e\u0445\u043e\u0442\u043d\u0438\u043a\u0430",   SHOP_STATBOOST_ACTION, "NemesisSystem.BountyVendor.StatBoosterRank", 2 },
+            { "\u041d\u0430\u0433\u0440\u0430\u0434\u044b \u0441\u043b\u0435\u0434\u043e\u043f\u044b\u0442\u0430",  SHOP_FAMILIAR_ACTION,  "NemesisSystem.BountyVendor.FamiliarRank", 3 },
+            { "\u041d\u0430\u0433\u0440\u0430\u0434\u044b \u0432\u0435\u0442\u0435\u0440\u0430\u043d\u0430",   SHOP_VETERAN_ACTION,   "NemesisSystem.BountyVendor.VeteranRank", 4 },
+        };
+
+        for (ShopEntry const& entry : entries)
+        {
+            std::string label = entry.label;
+            if (entry.rankKey && rank < uint8(sConfigMgr->GetOption<uint32>(entry.rankKey, entry.rankDefault)))
+                label += " (\u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u043e)";
+            AddGossipItemFor(player, GOSSIP_ICON_VENDOR, label,
+                GOSSIP_SENDER_MAIN, entry.action);
+        }
+
+        // "Назад"
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+            "\u041d\u0430\u0437\u0430\u0434",
+            GOSSIP_SENDER_MAIN, SHOP_BACK_ACTION);
+
+        SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
+    }
+
+    // Special daily task view: header text describes the current state, the
+    // menu offers accept/abandon. The day's task choice is final - after an
+    // abandon only the SAME type can be re-accepted (fresh timer for SPEED).
+    void ShowSpecialTask(Player* player, Creature* creature)
+    {
+        ClearGossipMenuFor(player);
+
+        NemesisSpecialTask::TaskState& st = NemesisSpecialTask::Load(player);
+        uint32 const now = uint32(GameTime::GetGameTime().count());
+        bool const freeChoice = NemesisSpecialTask::FreeChoice();
+        bool const completedToday = st.completed && !NemesisSpecialTask::NoDailyLimit();
+
+        // Lazy speed-timer expiry so the menu never shows a dead countdown.
+        if (!st.completed && st.acceptedAt && st.type == NemesisSpecialTask::TASK_SPEED
+            && now - st.acceptedAt > NemesisSpecialTask::GetSpeedLimitSeconds())
+        {
+            st.acceptedAt = 0;
+            NemesisSpecialTask::Persist(player, st);
+        }
+
+        // The day's task is assigned by fate (FreeChoice unlocks all - PTR).
+        uint8 const todayType = NemesisSpecialTask::RollDailyType(player);
+        bool const active = !st.completed && st.acceptedAt;
+
+        std::string title;
+        std::string zone;
+        bool const haveTarget = active && st.type != NemesisSpecialTask::TASK_DUNGEON
+            && NemesisSpecialTask::GetTargetDisplay(st.targetSpawn, title, zone);
+
+        std::string header;
+        if (completedToday)
+        {
+            header = "\u041f\u043e\u0440\u0443\u0447\u0435\u043d\u0438\u0435 \u043d\u0430 \u0441\u0435\u0433\u043e\u0434\u043d\u044f \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d\u043e. \u0412\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0439\u0441\u044f \u0437\u0430\u0432\u0442\u0440\u0430.";
+        }
+        else if (active)
+        {
+            switch (st.type)
+            {
+                case NemesisSpecialTask::TASK_SPEED:
+                {
+                    uint32 const limit = NemesisSpecialTask::GetSpeedLimitSeconds();
+                    uint32 const elapsed = now - st.acceptedAt;
+                    std::string const left = NemesisSpecialTask::FormatDuration(elapsed >= limit ? 0 : limit - elapsed);
+                    header = haveTarget
+                        ? Acore::StringFormat("\u0413\u043e\u0440\u044f\u0447\u0438\u0439 \u0441\u043b\u0435\u0434: {} - {}. \u041e\u0441\u0442\u0430\u043b\u043e\u0441\u044c: {}.", title, zone, left)
+                        : Acore::StringFormat("\u0413\u043e\u0440\u044f\u0447\u0438\u0439 \u0441\u043b\u0435\u0434: \u0434\u043e\u0431\u044b\u0447\u0430 \u0440\u044f\u0434\u043e\u043c, \u0438 \u0441\u043b\u0435\u0434 \u0435\u0449\u0451 \u043d\u0435 \u043e\u0441\u0442\u044b\u043b. \u041e\u0441\u0442\u0430\u043b\u043e\u0441\u044c: {}.", left);
+                    break;
+                }
+                case NemesisSpecialTask::TASK_CONTINENT:
+                    header = haveTarget
+                        ? Acore::StringFormat("\u0417\u0430\u043c\u043e\u0440\u0441\u043a\u0430\u044f \u043e\u0445\u043e\u0442\u0430: {} \u0436\u0434\u0451\u0442 - {}. \u0421\u043b\u0430\u0431\u0430\u044f \u0434\u043e\u0431\u044b\u0447\u0430 \u043d\u0435 \u0441\u0447\u0438\u0442\u0430\u0435\u0442\u0441\u044f.", title, zone)
+                        : Acore::StringFormat("\u0417\u0430\u043c\u043e\u0440\u0441\u043a\u0430\u044f \u043e\u0445\u043e\u0442\u0430: \u0433\u0440\u043e\u0437\u043d\u044b\u0439 \u0432\u0440\u0430\u0433 \u0436\u0434\u0451\u0442 {}. \u0421\u043b\u0430\u0431\u0430\u044f \u0434\u043e\u0431\u044b\u0447\u0430 \u043d\u0435 \u0441\u0447\u0438\u0442\u0430\u0435\u0442\u0441\u044f.", NemesisSpecialTask::ContinentName(st.param));
+                    break;
+                case NemesisSpecialTask::TASK_DUNGEON:
+                    header = st.targetSpawn
+                        ? Acore::StringFormat("\u041e\u0445\u043e\u0442\u0430 \u0432\u043e \u0442\u044c\u043c\u0435: \u00ab{}\u00bb. \u041f\u043e\u0432\u0435\u0440\u0436\u0435\u043d\u043e: {} \u0438\u0437 {}.", NemesisSpecialTask::DungeonName(st.targetSpawn), uint32(st.param), NemesisSpecialTask::GetDungeonMinKills())
+                        : Acore::StringFormat("\u041e\u0445\u043e\u0442\u0430 \u0432\u043e \u0442\u044c\u043c\u0435: \u0438\u0441\u0442\u0440\u0435\u0431\u0438 \u0447\u0443\u0434\u043e\u0432\u0438\u0449 \u0432 \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u044f\u0445. \u041f\u043e\u0432\u0435\u0440\u0436\u0435\u043d\u043e: {} \u0438\u0437 {}.", uint32(st.param), NemesisSpecialTask::GetDungeonMinKills(player));
+                    break;
+                default:
+                    break;
+            }
+        }
+        else
+        {
+            header = freeChoice
+                ? "\u0412\u044b\u0431\u0438\u0440\u0430\u0439 \u043b\u044e\u0431\u043e\u0435 \u0434\u0435\u043b\u043e - \u0441\u0435\u0433\u043e\u0434\u043d\u044f \u044f \u043d\u0435 \u043f\u0440\u0438\u0432\u0435\u0440\u0435\u0434\u043b\u0438\u0432."
+                : Acore::StringFormat("\u0421\u0435\u0433\u043e\u0434\u043d\u044f \u0435\u0441\u0442\u044c \u043b\u0438\u0448\u044c \u043e\u0434\u043d\u043e \u0434\u0435\u043b\u043e - \u00ab{}\u00bb. {}",
+                    NemesisSpecialTask::TaskName(todayType), NemesisSpecialTask::TaskOfferText(todayType));
+        }
+
+        if (!completedToday && !active)
+        {
+            if (freeChoice)
+            {
+                for (uint8 tt = NemesisSpecialTask::TASK_SPEED; tt <= NemesisSpecialTask::TASK_DUNGEON; ++tt)
+                    AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
+                        Acore::StringFormat("\u041f\u0440\u0438\u043d\u044f\u0442\u044c: {}", NemesisSpecialTask::TaskName(tt)),
+                        GOSSIP_SENDER_MAIN, TASK_MENU_ACTION + tt);
+            }
+            else
+                AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
+                    Acore::StringFormat("\u041f\u0440\u0438\u043d\u044f\u0442\u044c: {}", NemesisSpecialTask::TaskName(todayType)),
+                    GOSSIP_SENDER_MAIN, TASK_MENU_ACTION + todayType);
+        }
+
+        if (active)
+            AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
+                "\u041e\u0442\u043a\u0430\u0437\u0430\u0442\u044c\u0441\u044f",
+                GOSSIP_SENDER_MAIN, TASK_ABANDON_ACTION);
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+            "\u041d\u0430\u0437\u0430\u0434",
+            GOSSIP_SENDER_MAIN, SHOP_BACK_ACTION);
+
+        uint32 const customTextId = 0x7E000000u | (player->GetGUID().GetCounter() & 0x00FFFFFFu);
+        SendCustomNpcText(player, header, customTextId);
+        SendGossipMenuFor(player, customTextId, creature->GetGUID());
+    }
+
     // Main board view. If the player has an active contract, hides the pool
     // and shows only the active bounty — the innkeeper refuses new work
     // until the current contract is resolved.
@@ -3913,6 +5721,12 @@ private:
                 active.targetTitle, hoursLeft, minsLeft);
             AddGossipItemFor(player, GOSSIP_ICON_TAXI, line,
                 GOSSIP_SENDER_MAIN, BOARD_ACTIVE_VIEW_ACTION);
+
+            // "Назад" — back to the innkeeper root menu. Without this the active
+            // board view is a dead end (only the [АКТИВНО] line), so the back
+            // button in the post-accept / active-bounty flow had no escape.
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Назад",
+                GOSSIP_SENDER_MAIN, SHOP_BACK_ACTION);
 
             SendGossipMenuFor(player, customTextId, creature->GetGUID());
             return;
@@ -4046,6 +5860,11 @@ private:
             }
         }
 
+        // "Назад" — back to the innkeeper root menu
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+            "\u041d\u0430\u0437\u0430\u0434",
+            GOSSIP_SENDER_MAIN, SHOP_BACK_ACTION);
+
         SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
     }
 
@@ -4141,6 +5960,146 @@ private:
     }
 };
 
+// ============================================================================
+// Ambient nemesis generation tick. See RunAmbientGenerationTick for the pass
+// itself; this script only paces it.
+// ============================================================================
+class NemesisAmbientWorldScript : public WorldScript
+{
+public:
+    NemesisAmbientWorldScript() : WorldScript("NemesisAmbientWorldScript") { }
+
+    void OnUpdate(uint32 diff) override
+    {
+        // Drain any in-flight `.nemesis addon bootstrap/sync` queues every
+        // tick (perf pacing — see ProcessPendingBootstraps()). Unconditional
+        // and independent of the ambient-generation timer below: it's a
+        // no-op (single empty-map check) whenever nothing is queued.
+        ProcessPendingBootstraps();
+
+        // Config is read only when the timer fires (plus one roll at startup).
+        // A per-world-tick GetOption would hammer the config map and spam
+        // "Missing property" warnings when a key is absent from the .conf.
+        if (!_nextTickMs)
+            _nextTickMs = RollNextInterval();
+
+        _timer += diff;
+        if (_timer < _nextTickMs)
+            return;
+        _timer = 0;
+        _nextTickMs = RollNextInterval();  // randomized cadence (5-10 min default)
+
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
+            return;
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.AmbientGeneration.Enable", true))
+            return;
+
+        uint32 births = 0;
+        uint32 rankUps = 0;
+        RunAmbientGenerationTick(births, rankUps);
+    }
+
+private:
+    static uint32 RollNextInterval()
+    {
+        uint32 const minSec = std::max<uint32>(30, sConfigMgr->GetOption<uint32>("NemesisSystem.AmbientGeneration.IntervalMinSeconds", 300));
+        uint32 const maxSec = std::max<uint32>(minSec, sConfigMgr->GetOption<uint32>("NemesisSystem.AmbientGeneration.IntervalMaxSeconds", 600));
+        return urand(minSec, maxSec) * IN_MILLISECONDS;
+    }
+
+    uint32 _timer = 0;
+    uint32 _nextTickMs = 0;
+};
+
+// ============================================================================
+// Dungeon map hook: push this instance's temporary nemeses to the addon of a
+// player entering the dungeon (creation-time pushes only reach players who
+// were already inside).
+// ============================================================================
+class NemesisDungeonMapScript : public AllMapScript
+{
+public:
+    NemesisDungeonMapScript() : AllMapScript("NemesisDungeonMapScript", { ALLMAPHOOK_ON_PLAYER_ENTER_ALL, ALLMAPHOOK_ON_DESTROY_MAP }) { }
+
+    void OnPlayerEnterAll(Map* map, Player* player) override
+    {
+        if (!map || !player)
+            return;
+
+        // Tell the addon the player's current dungeon mapId (0 = open world)
+        // so its zone tab can match dungeon nemeses by mapId — instances have
+        // no world-map file and zone-name matching is unreliable (subzones).
+        if (player->GetSession())
+            SendAddonPayload(player, Acore::StringFormat("V2:DUNGEON:{}",
+                map->IsDungeon() ? map->GetId() : 0u));
+
+        if (!map->IsDungeon())
+            return;
+        if (!sConfigMgr->GetOption<bool>("NemesisSystem.Enable", false))
+            return;
+
+        // One-time per-instance sweep: Map::AddPlayerToMap preloads the
+        // visibility-range grids BEFORE the player joins the map's player
+        // list, so spawn-time rolls saw an empty map and skipped everything.
+        // Mark the instance, then roll every loaded stateless creature once.
+        bool const realOnly = sConfigMgr->GetOption<bool>("NemesisSystem.DungeonNemesis.RequireRealPlayers", true);
+        if ((!realOnly || !IsPlayerbotVictim(player))
+            && RealDungeonInstances.insert(map->GetInstanceId()).second)
+        {
+            uint32 births = 0;
+            for (auto const& pair : map->GetCreatureBySpawnIdStore())
+                if (Creature* candidate = pair.second)
+                    if (TryRollDungeonNemesis(candidate, false))
+                        ++births;
+
+            // One presence message for the whole sweep, not one per birth.
+            if (births)
+                AnnounceDungeonPresence(map);
+        }
+
+        for (auto const& [guid, state] : ActiveTemporaryNemeses)
+        {
+            if (state.mapId != map->GetId())
+                continue;
+            // ObjectAccessor resolves only creatures in the PLAYER's own
+            // instance - other instances of the same dungeon are filtered.
+            Creature* creature = ObjectAccessor::GetCreature(*player, guid);
+            if (!creature || !creature->IsAlive())
+                continue;
+            SendValidatedNemesisUpsert(player, creature->GetSpawnId(), state);
+        }
+
+        // Scouting report for the clearing task: is there prey in here?
+        if (NemesisSpecialTask::IsDungeonTaskTarget(player, map->GetId()))
+        {
+            uint32 alive = 0;
+            for (auto const& [tguid, tstate] : ActiveTemporaryNemeses)
+            {
+                if (tstate.mapId != map->GetId())
+                    continue;
+                Creature* c = ObjectAccessor::GetCreature(*player, tguid);
+                if (c && c->IsAlive())
+                    ++alive;
+            }
+            if (alive)
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "\u0427\u0443\u0434\u043e\u0432\u0438\u0449 \u0437\u0430\u0442\u0430\u0438\u043b\u043e\u0441\u044c \u0440\u044f\u0434\u043e\u043c: {}.", alive);
+            else
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "\u0417\u0434\u0435\u0441\u044c \u043f\u043e\u043a\u0430 \u0442\u0438\u0445\u043e. \u0427\u0443\u0434\u043e\u0432\u0438\u0449\u0430 \u043c\u043e\u0433\u0443\u0442 \u0442\u0430\u0438\u0442\u044c\u0441\u044f \u0433\u043b\u0443\u0431\u0436\u0435 - \u0438\u043b\u0438 \u0432 \u0434\u0440\u0443\u0433\u043e\u043c \u043f\u043e\u0434\u0437\u0435\u043c\u0435\u043b\u044c\u0435.");
+        }
+    }
+
+    void OnDestroyMap(Map* map) override
+    {
+        if (map && map->IsDungeon())
+        {
+            RealDungeonInstances.erase(map->GetInstanceId());
+            LastDungeonPresenceTs.erase(map->GetInstanceId());
+        }
+    }
+};
+
 void AddSC_mod_nemesis_system()
 {
     new NemesisSystemPlayerScript();
@@ -4148,4 +6107,6 @@ void AddSC_mod_nemesis_system()
     new NemesisSystemUnitScript();
     new NemesisSystemCommandScript();
     new NemesisBountyVendorScript();
+    new NemesisAmbientWorldScript();
+    new NemesisDungeonMapScript();
 }

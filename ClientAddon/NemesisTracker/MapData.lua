@@ -36,8 +36,21 @@ local byZoneId = {
     [490] = { file = "UnGoroCrater" },
     [493] = { file = "Moonglade" },
     [618] = { file = "Winterspring" },
+    [1] = { file = "DunMorogh" },
+    [3] = { file = "Badlands" },
+    [4] = { file = "BlastedLands" },
     [8] = { file = "SwampOfSorrows" },
     [10] = { file = "Duskwood" },
+    -- NB: Blizzard's internal map file really is "Aszhara" (s-z swapped).
+    [16] = { file = "Aszhara" },
+    [616] = { file = "Hyjal" },
+    [1377] = { file = "Silithus" },
+    [1657] = { file = "Darnassis" },
+    [3557] = { file = "TheExodar" },
+    [3487] = { file = "SilvermoonCity" },
+    [3703] = { file = "ShattrathCity" },
+    [4080] = { file = "Sunwell" },
+    [4197] = { file = "LakeWintergrasp" },
     [11] = { file = "Wetlands" },
     [12] = { file = "Elwynn" },
     [14] = { file = "Durotar" },
@@ -74,6 +87,18 @@ local byZoneId = {
     [4395] = { file = "Dalaran1_" },
 }
 
+-- NB: this table only ever matches when the server sends an English zone
+-- name (it currently sends the ruRU AreaTable string for every zone, so in
+-- practice this is a dead/legacy fallback — see byZoneId, which is checked
+-- next and is the table that actually needs to stay complete). Kept as a
+-- defensive fallback for chunked-payload edge cases; do not rely on it for
+-- new zones. For "is this nemesis in the zone I'm standing in" checks
+-- (as opposed to "the zone the world map is scrolled to"), WorldMap.lua's
+-- isNemesisInPlayerZone matches on GetRealZoneText() vs nemesis.zoneName
+-- directly and doesn't need this table either — see the comments there.
+-- Do NOT use GetCurrentMapAreaID() for any of this: in the 3.3.5a client
+-- it returns a WorldMapArea.dbc ID, not an AreaTable zone ID, and the two
+-- don't correspond — see agent memory nemesis-dev/worldmap-zone-matching.md.
 local byZoneName = {
     ["Badlands"] = { file = "Badlands" },
     ["Arathi Highlands"] = { file = "Arathi" },
@@ -89,6 +114,7 @@ local byZoneName = {
     ["Stonetalon Mountains"] = { file = "StonetalonMountains" },
     ["Hillsbrad Foothills"] = { file = "Hilsbrad" },
     ["Wetlands"] = { file = "Wetlands" },
+    ["Darkshore"] = { file = "Darkshore" },
     ["Westfall"] = { file = "Westfall" },
     ["Tanaris"] = { file = "Tanaris" },
     ["Dustwallow Marsh"] = { file = "Dustwallow" },

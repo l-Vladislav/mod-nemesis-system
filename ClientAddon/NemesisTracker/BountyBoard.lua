@@ -9,8 +9,9 @@ local NT = NemesisTracker
 NT.BountyBoard = NT.BountyBoard or {}
 local BB = NT.BountyBoard
 
--- Rank metadata — mirrors server NemesisReputation tiers. Thresholds here
--- are for display only; the server is the source of truth for the rank.
+-- Rank metadata. The server is the source of truth for the rank AND its
+-- thresholds: every payload carries repRank + repTierFloor/repTierNext, so the
+-- bar curve is never hardcoded here (it can't drift from the server config).
 local RANK_NAMES = {
     [1] = "Послушник",
     [2] = "Охотник",
@@ -18,8 +19,6 @@ local RANK_NAMES = {
     [4] = "Ветеран Охоты",
     [5] = "Легенда Охоты",
 }
-
-local RANK_THRESHOLDS = { 0, 500, 2500, 8000, 20000 }
 
 -- Tier colors mirror Blizz FACTION_BAR_COLORS so the rep bar reads as a
 -- native rep bar (Neutral → Friendly → Honored → Revered → Exalted).
@@ -531,6 +530,77 @@ function BB:BuildHuntTab(parent)
     bountyBox.details:SetJustifyV("TOP")
     bountyBox.details:SetWordWrap(true)
 
+    -- Особое поручение — epic-quest styled panel below the active contract.
+    local taskBox = CreateFrame("Frame", nil, parent)
+    taskBox:SetPoint("TOPLEFT",  bountyBox, "BOTTOMLEFT",  0, -6)
+    taskBox:SetPoint("TOPRIGHT", bountyBox, "BOTTOMRIGHT", 0, -6)
+    taskBox:SetHeight(58)
+    setPageBackdrop(taskBox)
+    parent.taskBox = taskBox
+
+    taskBox.header = taskBox:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    taskBox.header:SetPoint("TOPLEFT", taskBox, "TOPLEFT", 0, -5)
+    taskBox.header:SetText("|cffa335eeОсобое поручение|r")
+
+    taskBox.title = taskBox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    taskBox.title:SetPoint("TOPLEFT", taskBox, "TOPLEFT", 0, -18)
+    taskBox.title:SetPoint("TOPRIGHT", taskBox, "TOPRIGHT", 0, -18)
+    taskBox.title:SetJustifyH("LEFT")
+
+    taskBox.details = taskBox:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    taskBox.details:SetPoint("TOPLEFT", taskBox, "TOPLEFT", 0, -32)
+    taskBox.details:SetPoint("BOTTOMRIGHT", taskBox, "BOTTOMRIGHT", 0, 4)
+    taskBox.details:SetJustifyH("LEFT")
+    taskBox.details:SetJustifyV("TOP")
+    taskBox.details:SetWordWrap(true)
+
+    -- Live countdown for the timed task: re-render once a second while the
+    -- hunt tab is visible (taskBox is hidden together with the tab content).
+    taskBox._acc = 0
+    taskBox:SetScript("OnUpdate", function(frame, elapsed)
+        frame._acc = frame._acc + elapsed
+        if frame._acc < 1 then return end
+        frame._acc = 0
+        local task = NT.GetActiveSpecialTask and NT:GetActiveSpecialTask()
+        if task and task.durationMin then
+            BB:RenderSpecialTaskBox(parent)
+        end
+    end)
+end
+
+-- Renders only the special-task panel (called from RenderHuntTab and the
+-- 1-second countdown ticker).
+function BB:RenderSpecialTaskBox(content)
+    local taskBox = content and content.taskBox
+    if not taskBox then return end
+
+    local task = NT.GetActiveSpecialTask and NT:GetActiveSpecialTask()
+    if task then
+        taskBox.title:SetText("|cffa335ee" .. (task.name or "Поручение") .. "|r")
+        local detail = task.condition or ""
+        if task.progressTotal then
+            detail = detail .. string.format("\n|cffffd100Повержено: %d из %d|r",
+                task.progressDone or 0, task.progressTotal)
+        end
+        if task.durationMin and task.acceptedAt then
+            local left = task.acceptedAt + task.durationMin * 60 - time()
+            if left < 0 then left = 0 end
+            local h = math.floor(left / 3600)
+            local m = math.floor((left % 3600) / 60)
+            local s = math.floor(left % 60)
+            local leftText
+            if h > 0 then
+                leftText = string.format("%d ч %02d мин", h, m)
+            else
+                leftText = string.format("%d:%02d", m, s)
+            end
+            detail = detail .. string.format("\n|cffffd100Осталось: %s|r", leftText)
+        end
+        taskBox.details:SetText(detail)
+    else
+        taskBox.title:SetText("|cff808080Нет активного поручения|r")
+        taskBox.details:SetText("|cffa0a0a0Спросите трактирщика об особом поручении.|r")
+    end
 end
 
 ----------------------------------------------------------------
@@ -650,11 +720,13 @@ function BB:FindActiveBountyNemesis()
     return nil
 end
 
--- Pulls repPoints/repRank from whichever nemesis entry has them populated.
--- Server writes them onto every outgoing addon payload per player, so any
--- stored entry's rep fields are current.
+-- Pulls the rep snapshot (points, rank, tier floor, next-tier threshold) from
+-- whichever nemesis entry has them populated. The server writes them onto
+-- every outgoing payload per player, so any stored entry's rep fields are
+-- current. Peer-shared entries carry none (0/nil), so they always lose the
+-- per-field max below; rep only ever increases, so the newest stamp wins.
 function BB:ReadRepSnapshot()
-    local points, rank = 0, 1
+    local points, rank, tierFloor, tierNext = 0, 1, 0, 0
     for _, nemesis in pairs(NT.data.nemeses or {}) do
         if nemesis.repPoints and nemesis.repPoints > points then
             points = nemesis.repPoints
@@ -662,8 +734,14 @@ function BB:ReadRepSnapshot()
         if nemesis.repRank and nemesis.repRank > rank then
             rank = nemesis.repRank
         end
+        if nemesis.repTierFloor and nemesis.repTierFloor > tierFloor then
+            tierFloor = nemesis.repTierFloor
+        end
+        if nemesis.repTierNext and nemesis.repTierNext > tierNext then
+            tierNext = nemesis.repTierNext
+        end
     end
-    return points, rank
+    return points, rank, tierFloor, tierNext
 end
 
 function BB:RenderHuntTab()
@@ -675,7 +753,7 @@ function BB:RenderHuntTab()
 
     -- Reputation footer (frame-level widgets, shared across tabs).
     local frame = self.frame
-    local points, rank = self:ReadRepSnapshot()
+    local points, rank, tierFloor, tierNext = self:ReadRepSnapshot()
     local rankName = RANK_NAMES[rank] or "—"
     local r, g, b = rankColorByTier(rank)
     if frame.repRankText then
@@ -685,20 +763,28 @@ function BB:RenderHuntTab()
     end
 
     if frame.repBar then
-        if rank >= 5 then
+        -- Bar bounds come from the server (repTierFloor/repTierNext); the addon
+        -- holds no rank curve, so the bar can't drift from the server config.
+        if rank >= #RANK_NAMES then
+            -- Max rank: full bar (checked first so a stale lower-rank stamp's
+            -- non-zero tierNext can't override the maxed display).
             frame.repBar:SetValue(1)
             if frame.repBarLabel then
                 frame.repBarLabel:SetText(string.format("%d (макс)", points))
             end
-        else
-            local nextThreshold = RANK_THRESHOLDS[rank + 1] or (points + 1)
-            local curThreshold  = RANK_THRESHOLDS[rank] or 0
-            local span = math.max(1, nextThreshold - curThreshold)
-            local progress = math.min(1, math.max(0, (points - curThreshold) / span))
-            local curInTier = points - curThreshold
+        elseif tierNext > tierFloor then
+            local span = tierNext - tierFloor
+            local curInTier = points - tierFloor
+            local progress = math.min(1, math.max(0, curInTier / span))
             frame.repBar:SetValue(progress)
             if frame.repBarLabel then
                 frame.repBarLabel:SetText(string.format("%d / %d", curInTier, span))
+            end
+        else
+            -- Server tier bounds not received yet (cold start): show raw points.
+            frame.repBar:SetValue(0)
+            if frame.repBarLabel then
+                frame.repBarLabel:SetText(string.format("%d", points))
             end
         end
         frame.repBar:SetStatusBarColor(r, g, b)
@@ -724,15 +810,20 @@ function BB:RenderHuntTab()
             "|cffa0a0a0Посетите трактирщика, чтобы принять охоту на голову.|r")
     end
 
+    -- Особое поручение
+    self:RenderSpecialTaskBox(content)
 end
 
 function BB:RenderZoneTab()
     local content = self.frame.tabContent[2]
     if not content or not content.rows then return end
 
-    -- Collect zone nemeses via WorldMap's locale-independent matcher.
+    -- Collect zone nemeses via WorldMap's player-zone matcher (this tab
+    -- means "zone I'm standing in", not "zone the world map happens to be
+    -- scrolled to" — IsNemesisInCurrentZone is the wrong check here, see
+    -- comments in WorldMap.lua on isNemesisInCurrentZone/isNemesisInPlayerZone).
     local zoneList = {}
-    local inZone = NT.WorldMap and NT.WorldMap.IsNemesisInCurrentZone
+    local inZone = NT.WorldMap and NT.WorldMap.IsNemesisInPlayerZone
     for _, nemesis in pairs(NT.data.nemeses or {}) do
         if inZone and inZone(nemesis) then
             table.insert(zoneList, nemesis)
