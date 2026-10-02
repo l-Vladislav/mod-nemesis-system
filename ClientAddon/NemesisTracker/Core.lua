@@ -25,6 +25,12 @@ NT.data = NT.data or {
     bootstrapExpected = 0,
     bootstrapActive = false,
     lastSyncAt = 0,
+    -- Perf: dedicated "when did WE last ask the server for a full
+    -- bootstrap" timestamp, separate from lastSyncAt (which also gets
+    -- bumped by unrelated peer-to-peer addon syncs). Used by
+    -- RequestBootstrap()'s cooldown guard. See NemesisSystem.cpp
+    -- ProcessPendingBootstraps for why this matters server-side too.
+    lastBootstrapRequestAt = 0,
     lastServerTime = 0,
     connectionState = "idle",
     currentFilter = "all",
@@ -117,21 +123,36 @@ local function zoneKey(zoneId, zoneName)
     return string.format("%s:%s", tostring(zoneId or 0), zoneName or "")
 end
 
-local function parseSpawnIdFromGuid(guid)
+-- Parse a creature GUID into (spawnId, entry).
+-- 3.3.5a HighGuid layout (see ObjectGuid.h ObjectGuid(hi, entry, counter)):
+--   _guid = counter | (entry << 24) | (hi << 48)
+-- As a 16-hex string: chars 1-4 = highGuid, 5-10 = entry, 11-16 = counter.
+-- Only HighGuid::Unit (0xF130) carries a creature spawn_id in its counter.
+-- Players (no high-guid prefix) and pets/vehicles (0xF140/F150) MUST NOT be
+-- treated as creature sightings, otherwise their lowGuid collides with real
+-- nemesis spawn_ids (e.g. a playerbot whose characters.guid equals a known
+-- nemesis spawn_id triggers a false sighting from wherever the bot stands).
+local function parseCreatureGuid(guid)
     if not guid then
-        return nil
+        return nil, nil
     end
 
-    local low = string.match(guid, "(%x+)$")
-    if not low then
-        return nil
+    local hex = string.match(guid, "(%x+)$")
+    if not hex or string.len(hex) ~= 16 then
+        return nil, nil
     end
 
-    if string.len(low) > 8 then
-        low = string.sub(low, -8)
+    if string.upper(string.sub(hex, 1, 4)) ~= "F130" then
+        return nil, nil
     end
 
-    return tonumber(low, 16)
+    local entry = tonumber(string.sub(hex, 5, 10), 16)
+    local spawnId = tonumber(string.sub(hex, 11, 16), 16)
+    if not spawnId or spawnId == 0 then
+        return nil, nil
+    end
+
+    return spawnId, entry
 end
 
 function NT:GetNow()
@@ -564,6 +585,10 @@ function NT:UpsertNemesisFromFields(fields, startIndex, source)
         repPoints = tonumber(fields[startIndex + 25]) or 0,
         repRank = tonumber(fields[startIndex + 26]) or 1,
         expiresAt = tonumber(fields[startIndex + 27]) or 0,
+        -- Server-authoritative rank-bar bounds (appended after expiresAt). Peer
+        -- shares omit them, so peer entries leave these nil/0 and lose the max.
+        repTierFloor = tonumber(fields[startIndex + 28]) or 0,
+        repTierNext = tonumber(fields[startIndex + 29]) or 0,
         lastSeenSource = source,
         isAlive = true,
         removeReason = nil,
@@ -773,6 +798,13 @@ function NT:ParseServerPayload(payload)
         end
         return
     end
+    if opcode == "DUNGEON" then
+        -- Server tells us the current dungeon mapId (0 = open world) so the
+        -- zone tab can match dungeon nemeses by mapId.
+        self.data.currentDungeonMapId = tonumber(fields[3]) or 0
+        scheduleRefresh()
+        return
+    end
     if opcode == "BOOTSTRAP_BEGIN" then
         self:BeginBootstrap(fields[3])
         return
@@ -831,13 +863,58 @@ function NT:HandleSystemMessage(message)
     self:ParseServerPayload(string.sub(message, string.len(prefix) + 1))
 end
 
-function NT:RequestBootstrap()
+-- Perf: a full `.nemesis addon bootstrap` walks every active nemesis
+-- world-wide server-side (paced across ticks server-side, but still real
+-- work) — it should not be re-sent on every zone change / chat line /
+-- auto-sync tick. This guard skips re-requesting when a bootstrap is
+-- already in flight (bootstrapActive, set once BOOTSTRAP_BEGIN comes back)
+-- or was requested less than BOOTSTRAP_COOLDOWN_SECONDS ago.
+-- `force=true` bypasses the guard entirely — used only for
+-- PLAYER_ENTERING_WORLD (login/reload/loading screen) so a cold client is
+-- guaranteed a full bootstrap regardless of any leftover state.
+local BOOTSTRAP_COOLDOWN_SECONDS = 45
+
+function NT:RequestBootstrap(force)
+    local now = self:GetNow()
+
+    if not force then
+        if self.data.bootstrapActive then
+            return
+        end
+        local lastRequest = self.data.lastBootstrapRequestAt or 0
+        if lastRequest > 0 and (now - lastRequest) < BOOTSTRAP_COOLDOWN_SECONDS then
+            return
+        end
+    end
+
+    self.data.lastBootstrapRequestAt = now
     self.data.connectionState = "requesting"
-    self.data.lastSyncAt = self:GetNow()
+    self.data.lastSyncAt = now
     if self.UI then
         self.UI:RefreshStatus()
     end
     self:SendServerCommand(".nemesis addon bootstrap")
+end
+
+-- Perf: coalesces the chat-keyword bootstrap trigger (below, in
+-- CHAT_MSG_SYSTEM) into at most one pending call at a time. Before this,
+-- EVERY matching chat line scheduled its own independent 2s timer with no
+-- cancellation of prior ones — a burst of bot-combat chat containing
+-- "ранг"/"обрёл"/etc. could queue up many overlapping RequestBootstrap()
+-- calls in a few seconds. Now a burst collapses to a single deferred call,
+-- which RequestBootstrap()'s own cooldown guard (above) then further caps
+-- to at most once per BOOTSTRAP_COOLDOWN_SECONDS.
+local pendingChatBootstrap = false
+
+local function ScheduleChatTriggeredBootstrap()
+    if pendingChatBootstrap then
+        return
+    end
+    pendingChatBootstrap = true
+    NT:ScheduleTimer(function()
+        pendingChatBootstrap = false
+        NT:RequestBootstrap()
+    end, 2)
 end
 
 function NT:RequestSync()
@@ -1044,7 +1121,7 @@ function NT:RefreshFromSources()
     self:RequestPeerSync()
 end
 
-function NT:ReportSighting(spawnId)
+function NT:ReportSighting(spawnId, entry)
     if not spawnId or not self.db.reportSightingsToServer then
         return
     end
@@ -1057,7 +1134,11 @@ function NT:ReportSighting(spawnId)
     end
 
     self.data.lastReportBySpawnId[spawnId] = now
-    self:SendServerCommand(string.format(".nemesis addon report %d", spawnId))
+    if entry and entry > 0 then
+        self:SendServerCommand(string.format(".nemesis addon report %d %d", spawnId, entry))
+    else
+        self:SendServerCommand(string.format(".nemesis addon report %d", spawnId))
+    end
 end
 
 function NT:TrackKnownUnit(unit)
@@ -1065,10 +1146,25 @@ function NT:TrackKnownUnit(unit)
         return
     end
 
-    local spawnId = parseSpawnIdFromGuid(UnitGUID(unit))
-    if spawnId and self.data.nemeses[spawnId] then
-        self:ReportSighting(spawnId)
+    local spawnId, entry = parseCreatureGuid(UnitGUID(unit))
+    if not spawnId then
+        return
     end
+
+    local cached = self.data.nemeses[spawnId]
+    if not cached then
+        return
+    end
+
+    -- Cross-check entry to guard against the (rare) case where the targeted
+    -- creature's GUID counter coincidentally equals a stale cache entry's
+    -- spawn_id but for a different creature_entry. Skip this check if either
+    -- side hasn't reported an entry yet.
+    if entry and (cached.creatureEntry or 0) > 0 and cached.creatureEntry ~= entry then
+        return
+    end
+
+    self:ReportSighting(spawnId, entry)
 end
 
 function NT:OnInitialize()
@@ -1123,7 +1219,11 @@ function NT:PLAYER_ENTERING_WORLD()
     end
     self:ScheduleTimer(function()
         if self.db.autoBootstrap then
-            self:RequestBootstrap()
+            -- Forced: a loading screen (login/reload/teleport/instance
+            -- enter) is exactly when stale/missing data is most likely, and
+            -- this event is inherently infrequent — not the spam vector the
+            -- cooldown guard exists for. See RequestBootstrap().
+            self:RequestBootstrap(true)
         end
         if self.db.autoPeerSync then
             self:RequestPeerSync()
@@ -1229,20 +1329,99 @@ function NT:ParseBountyChat(message)
     end
 end
 
+-- Special daily task tracking ("особое поручение") -------------------------
+-- Same chat-parsing approach as bounty contracts. Server anchors (2026-06-07,
+-- prefix-less): "Поручение принято: {имя}. {условие}" / "Поручение отменено."
+-- / "Особое поручение выполнено!" / "Время вышло."
+
+function NT:GetActiveSpecialTask()
+    return self.db and self.db.activeSpecialTask or nil
+end
+
+function NT:SetActiveSpecialTask(task)
+    if not self.db then return end
+    self.db.activeSpecialTask = task
+    if self.UI then
+        self.UI:RefreshAll()
+    end
+    if self.BountyBoard and self.BountyBoard.Refresh then
+        self.BountyBoard:Refresh()
+    end
+end
+
+function NT:ParseSpecialTaskChat(message)
+    local anchor = "Поручение принято: "
+    local startIdx = string.find(message, anchor, 1, true)
+    if startIdx then
+        local tail = string.sub(message, startIdx + string.len(anchor))
+        local name, condition = string.match(tail, "^(.-)%.%s*(.*)$")
+        name = name or tail
+        -- Duration forms: "за 2 ч." / "за 1 ч 30 мин." / legacy "за 120 мин."
+        local minutes
+        local hours = tonumber(string.match(tail, "за (%d+) ч"))
+        if hours then
+            minutes = hours * 60 + (tonumber(string.match(tail, "ч (%d+) мин")) or 0)
+        else
+            minutes = tonumber(string.match(tail, "за (%d+) мин"))
+        end
+        -- Clearing quota, e.g. "...убей не менее 3 сильных чудовищ."
+        local total = tonumber(string.match(tail, "не менее (%d+)"))
+        self:SetActiveSpecialTask({
+            name = name,
+            condition = condition or "",
+            acceptedAt = time(),
+            durationMin = minutes,
+            progressDone = total and 0 or nil,
+            progressTotal = total,
+        })
+        return
+    end
+    -- Clearing progress: "Охота во тьме: повержено 1 из 3."
+    local done, total = string.match(message, "повержено (%d+) из (%d+)")
+    if done then
+        local task = self:GetActiveSpecialTask()
+        if task then
+            task.progressDone = tonumber(done)
+            task.progressTotal = tonumber(total)
+            self:SetActiveSpecialTask(task)
+        end
+        return
+    end
+    if string.find(message, "Поручение отменено", 1, true)
+        or string.find(message, "Особое поручение выполнено", 1, true)
+        or string.find(message, "Время вышло", 1, true) then
+        self:SetActiveSpecialTask(nil)
+        return
+    end
+end
+
 function NT:CHAT_MSG_SYSTEM(_, message)
     self:HandleSystemMessage(message)
 
-    -- Parse bounty contract events.
-    if message and string.find(message, "Немезида", 1, true)
-        and string.find(message, "Контракт", 1, true) then
+    -- Parse bounty contract events. (The server dropped the "[Немезида]: "
+    -- prefix on 2026-06-07 — gate on the anchor word only.)
+    if message and string.find(message, "Контракт", 1, true) then
         self:ParseBountyChat(message)
     end
 
-    -- Trigger sync when a nemesis announcement appears in chat
-    if message and (string.find(message, "[Nemesis]", 1, true) or string.find(message, "Немезида", 1, true)) then
-        self:ScheduleTimer(function()
-            self:RequestBootstrap()
-        end, 2)
+    -- Parse special daily task events.
+    if message and string.find(message, "оручени", 1, true) then
+        self:ParseSpecialTaskChat(message)
+    end
+
+    -- Trigger sync when a nemesis announcement appears in chat. The word
+    -- "немезида" was RP-cleansed from announcements (2026-06-07); match the
+    -- markers the new texts carry: rank-ups/kills ("ранг"), birth flavors
+    -- ("обрёл(а)"/"стал(а)"), and the dungeon presence line ("присутствие").
+    if message and (string.find(message, "[Nemesis]", 1, true)
+        or string.find(message, "немезид", 1, true)
+        or string.find(message, "Немезида", 1, true)
+        or string.find(message, "ранг", 1, true)
+        or string.find(message, "обрёл", 1, true)
+        or string.find(message, "обрел", 1, true)
+        or string.find(message, "стал(а)", 1, true)
+        or string.find(message, "присутствие", 1, true)) then
+        ScheduleChatTriggeredBootstrap()
     end
 end
 

@@ -362,6 +362,25 @@ NemesisSystem.AddonBootstrapRecentHours = 24
 NemesisSystem.AddonBootstrapMaxEntries = 100
 
 #
+#    NemesisSystem.AddonBootstrapEntriesPerTick
+#        Description: Perf pacing for `.nemesis addon bootstrap`/`sync`
+#                     (includeAll=true, unfiltered by MaxEntries above — the
+#                     "full" bootstrap used to build+send every active
+#                     nemesis world-wide synchronously in one command,
+#                     which could block the main thread for ~190ms on a
+#                     busy world). This caps how many nemesis entries may be
+#                     built+sent per world tick, shared across every
+#                     player's in-flight bootstrap that tick; the rest
+#                     drains over subsequent ticks. Lower = smaller per-tick
+#                     hit but slower to finish; higher = faster but bigger
+#                     per-tick hit. Does not change what gets sent, only how
+#                     it's paced.
+#        Default:     50
+#
+
+NemesisSystem.AddonBootstrapEntriesPerTick = 50
+
+#
 #    NemesisSystem.AddonReportCooldownSeconds
 #        Description: Minimum time between validated addon sighting updates for
 #                     the same nemesis spawn.
@@ -387,12 +406,287 @@ NemesisSystem.BountyVendor.Enable = 1
 
 #
 #    NemesisSystem.BountyVendor.Entry
-#        Description: The npc_vendor entry used for the bounty vendor inventory.
+#        Description: The npc_vendor entry used for the LEGACY flat bounty
+#                     vendor inventory (used only when RankMenus is disabled).
 #                     All innkeepers share this vendor entry.
 #        Default:     190000
 #
 
 NemesisSystem.BountyVendor.Entry = 190000
+
+#
+#    NemesisSystem.BountyVendor.RankMenus.Enable
+#        Description: Replace the flat vendor with rank-gated gossip submenus:
+#                     "Общие товары" (rank 1), "Печати и нашивки" (StatBooster,
+#                     rank 2), "Сумки с фамильярами" (familiar gacha, rank 3).
+#                     Locked submenus stay visible with a rank-requirement note.
+#        Default:     1 - Enabled
+#                     0 - Disabled (legacy flat vendor via .Entry)
+#
+
+NemesisSystem.BountyVendor.RankMenus.Enable = 1
+
+#
+#    NemesisSystem.BountyVendor.GeneralEntry
+#        Description: npc_vendor entry for the "Общие товары" submenu (rank 1+):
+#                     universal gacha bag, Attribute Recalibrator, T1 consumables.
+#        Default:     190100
+#
+
+NemesisSystem.BountyVendor.GeneralEntry = 190100
+
+#
+#    NemesisSystem.BountyVendor.StatBoosterEntry
+#        Description: npc_vendor entry for the "Печати и нашивки" submenu:
+#                     all StatBooster consumables (T1-T4).
+#        Default:     190101
+#
+
+NemesisSystem.BountyVendor.StatBoosterEntry = 190101
+
+#
+#    NemesisSystem.BountyVendor.FamiliarEntry
+#        Description: npc_vendor entry for the "Сумки с фамильярами" submenu:
+#                     the 10 element gacha bags (5 adventurer coins each).
+#        Default:     190102
+#
+
+NemesisSystem.BountyVendor.FamiliarEntry = 190102
+
+#
+#    NemesisSystem.BountyVendor.StatBoosterRank
+#        Description: Minimum Hunter's Covenant reputation rank (1-5) required
+#                     to open the StatBooster submenu.
+#        Default:     2 (Охотник)
+#
+
+NemesisSystem.BountyVendor.StatBoosterRank = 2
+
+#
+#    NemesisSystem.BountyVendor.FamiliarRank
+#        Description: Minimum Hunter's Covenant reputation rank (1-5) required
+#                     to open the familiar bags submenu.
+#        Default:     3 (Следопыт)
+#
+
+NemesisSystem.BountyVendor.FamiliarRank = 3
+
+########################################
+# AMBIENT NEMESIS GENERATION
+########################################
+
+#
+#    NemesisSystem.AmbientGeneration.Enable
+#        Description: Periodically promote a random eligible mob to nemesis in
+#                     open-world zones occupied by players, while the zone has
+#                     fewer nemeses than FillPercent of MaxPerZone.
+#                     One birth per zone per tick. Births have no victim
+#                     (nemesis_target_guid = 0).
+#        Default:     1 - Enabled
+#
+
+NemesisSystem.AmbientGeneration.Enable = 1
+
+#
+#    NemesisSystem.AmbientGeneration.IntervalMinSeconds
+#    NemesisSystem.AmbientGeneration.IntervalMaxSeconds
+#        Description: Each generation pass is followed by a RANDOM pause of
+#                     [Min, Max] seconds, so births don't land on a fixed
+#                     rhythm. Min is clamped to >= 30, Max to >= Min.
+#        Default:     300 / 600 (5-10 minutes)
+#
+
+NemesisSystem.AmbientGeneration.IntervalMinSeconds = 300
+NemesisSystem.AmbientGeneration.IntervalMaxSeconds = 600
+
+#
+#    NemesisSystem.AmbientGeneration.FillPercent
+#        Description: Target fill level as a percent of NemesisSystem.MaxPerZone.
+#                     A zone below this share of the cap gets one ambient birth
+#                     per tick. Requires a finite MaxPerZone (0 disables ambient).
+#        Default:     50
+#
+
+NemesisSystem.AmbientGeneration.FillPercent = 50
+
+#
+#    NemesisSystem.AmbientGeneration.EliteChance
+#        Description: Percent chance (0-100) an ambient birth prefers an
+#                     ELITE candidate when one exists in the zone — keeps
+#                     continent-hunt (elite) targets present in the world.
+#        Default:     25
+#
+
+NemesisSystem.AmbientGeneration.EliteChance = 25
+
+#
+#    NemesisSystem.AmbientGeneration.RankUpChance
+#        Description: Percent chance (0-100) that a zone's ambient action
+#                     RANKS UP an existing live nemesis of that zone instead
+#                     of creating a new one. Honors the regular rank-up
+#                     cooldown; falls back to a birth when no candidate.
+#        Default:     10
+#
+
+NemesisSystem.AmbientGeneration.RankUpChance = 10
+
+#
+#    NemesisSystem.AmbientGeneration.RequireRealPlayers
+#        Description: Only consider zones holding at least one REAL player
+#                     (playerbots do not count). With 0, bot-populated zones
+#                     also breed nemeses — the whole world fills up.
+#        Default:     1
+#
+
+NemesisSystem.AmbientGeneration.RequireRealPlayers = 1
+
+#
+#    NemesisSystem.AmbientGeneration.Announce
+#        Description: Announce ambient births with creature-type flavor text
+#                     ("...вкусил(а) крови и обрёл(а) силу немезиды!").
+#        Default:     1
+#
+
+NemesisSystem.AmbientGeneration.Announce = 1
+
+#
+#    NemesisSystem.AmbientGeneration.AnnounceZoneOnly
+#        Description: Send the birth announcement only to players in the zone
+#                     where it happened (0 = server-wide system message).
+#        Default:     1
+#
+
+NemesisSystem.AmbientGeneration.AnnounceZoneOnly = 1
+
+#
+#    NemesisSystem.HunterRankScaling.Enable
+#        Description: Seasoned hunters breed seasoned foes - nemeses born
+#                     around a player start with a rank bonus from their
+#                     Hunter's Covenant rank: 1-2 -> +0, 3-4 -> +1, 5 -> +2.
+#                     Applies to kill-driven creation (victim's rank),
+#                     dungeon spawns (best rank in the instance), ambient
+#                     births (best rank in the zone) and task-target breeding.
+#        Default:     1
+#
+
+NemesisSystem.HunterRankScaling.Enable = 1
+
+########################################
+# DUNGEON NEMESES
+########################################
+
+#
+#    NemesisSystem.DungeonNemesis.Enable
+#        Description: Creatures spawning in dungeon maps roll a chance to
+#                     become a TEMPORARY nemesis (weighted random rank
+#                     50/30/15/4/1, trash and elites only, bosses excluded).
+#                     Per-instance, never persisted, dies with the instance.
+#        Default:     1
+#
+
+NemesisSystem.DungeonNemesis.Enable = 1
+
+#
+#    NemesisSystem.DungeonNemesis.Chance
+#        Description: Percent chance per eligible creature spawn.
+#        Default:     3.0
+#
+
+NemesisSystem.DungeonNemesis.Chance = 3.0
+
+#
+#    NemesisSystem.DungeonNemesis.IncludeRaids
+#        Description: Also roll in raid maps.
+#        Default:     0
+#
+
+NemesisSystem.DungeonNemesis.IncludeRaids = 0
+
+#
+#    NemesisSystem.DungeonNemesis.RequireRealPlayers
+#        Description: Only roll when the instance holds at least one real
+#                     player (playerbot-only runs excluded).
+#        Default:     1
+#
+
+NemesisSystem.DungeonNemesis.RequireRealPlayers = 1
+
+########################################
+# SPECIAL DAILY TASKS (особые поручения)
+########################################
+
+#
+#    NemesisSpecialTask.Enable
+#        Description: Innkeeper gossip "Особое поручение" — one completion per
+#                     day, day's choice is final. Types: speed kill / opposite
+#                     classic continent / dungeon nemesis.
+#        Default:     1
+#
+
+NemesisSpecialTask.Enable = 1
+
+#
+#    NemesisSpecialTask.SpeedKillMinutes
+#        Description: Time limit for the speed-kill task (2 hours).
+#        Default:     120
+#
+
+NemesisSpecialTask.SpeedKillMinutes = 120
+
+#
+#    NemesisSpecialTask.TargetLevelBand
+#        Description: World-task targets (speed/continent) must be within
+#                     +- this many levels of the player - both for the named
+#                     target selection and for kill credit.
+#        Default:     3
+#
+
+NemesisSpecialTask.TargetLevelBand = 3
+
+#
+#    NemesisSpecialTask.FreeChoice
+#        Description: TESTING — show all three tasks instead of the assigned
+#                     daily roll. Leave 0 in production.
+#        Default:     0
+#
+
+NemesisSpecialTask.FreeChoice = 0
+
+#
+#    NemesisSpecialTask.NoDailyLimit
+#        Description: TESTING — ignore the one-completion-per-day cap.
+#                     Leave 0 in production.
+#        Default:     0
+#
+
+NemesisSpecialTask.NoDailyLimit = 0
+
+#
+#    NemesisSpecialTask.RewardItem
+#        Description: Reward item (Монета авантюриста).
+#        Default:     110150
+#
+
+NemesisSpecialTask.RewardItem = 110150
+
+#
+#    NemesisSpecialTask.Reward.Speed / .Continent / .Dungeon
+#        Description: Coin count per completed task type (by difficulty).
+#        Default:     1 / 2 / 3
+#
+
+NemesisSpecialTask.Reward.Speed = 1
+NemesisSpecialTask.Reward.Continent = 1
+NemesisSpecialTask.Reward.Dungeon = 1
+
+#
+#    NemesisSpecialTask.DungeonMinKills
+#        Description: Minimum dungeon-nemesis kills for the clearing task
+#                     (plus none left alive in the instance).
+#        Default:     3
+#
+
+NemesisSpecialTask.DungeonMinKills = 3
 
 ###############################################################################
 # BOUNTY BOARD SETTINGS
@@ -550,7 +844,7 @@ NemesisRep.Enable = 1
 #        Default:     50
 #
 
-NemesisRep.BasePerKill = 50
+NemesisRep.BasePerKill = 0
 
 #
 #    NemesisRep.PerRankBonus
@@ -559,7 +853,7 @@ NemesisRep.BasePerKill = 50
 #        Default:     10
 #
 
-NemesisRep.PerRankBonus = 10
+NemesisRep.PerRankBonus = 1
 
 #
 #    NemesisRep.BountyCompletionBonus
@@ -569,7 +863,7 @@ NemesisRep.PerRankBonus = 10
 #        Default:     200
 #
 
-NemesisRep.BountyCompletionBonus = 200
+NemesisRep.BountyCompletionBonus = 10
 
 #
 #    NemesisRep.BountyCompletionPerRank
@@ -578,16 +872,27 @@ NemesisRep.BountyCompletionBonus = 200
 #        Default:     50
 #
 
-NemesisRep.BountyCompletionPerRank = 50
+NemesisRep.BountyCompletionPerRank = 5
+
+#
+#    NemesisRep.SpecialTaskBonus
+#        Description: Hunter's Covenant reputation granted on completing the
+#                     innkeeper's daily special task.
+#                     Total = Bonus + PerRank x hunter rank.
+#        Default:     100 / 1
+#
+
+NemesisRep.SpecialTaskBonus = 100
+NemesisRep.SpecialTaskPerRank = 1
 
 #
 #    NemesisRep.Threshold.Rank2..Rank5
 #        Description: Rep points required to promote into each tier.
 #                     Rank 1 (Послушник) starts at 0 and has no threshold.
-#        Defaults:    500 / 2500 / 8000 / 20000
+#        Defaults:    1000 / 5000 / 16000 / 40000
 #
 
-NemesisRep.Threshold.Rank2 = 500
-NemesisRep.Threshold.Rank3 = 2500
-NemesisRep.Threshold.Rank4 = 8000
-NemesisRep.Threshold.Rank5 = 20000
+NemesisRep.Threshold.Rank2 = 1000
+NemesisRep.Threshold.Rank3 = 5000
+NemesisRep.Threshold.Rank4 = 16000
+NemesisRep.Threshold.Rank5 = 40000
